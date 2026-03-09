@@ -1,201 +1,546 @@
 # ERA5 Hourly Data Downloader and Extractor
 
-## Overview:
+## Overview
 
-This script is designed to work with ERA5 reanalysis data from ECMWF using both the CDS API and the MARS (Meteorological Archive and Retrieval System). MARS is ECMWF’s archive retrieval system that enables users to request data using a strictly defined syntax. Detailed information on MARS request syntax and best practices can be found in the official [MARS User Documentation](https://confluence.ecmwf.int/display/UDOC/MARS+user-documentation).
-![Alt text](https://github.com/user-attachments/assets/c3d475af-8c52-497c-a51a-dc59fa92a0c7)
-The script supports two operational modes:
+`download_era5_data.py` downloads and/or extracts hourly ERA5 single-level data from ECMWF GRIB files for a fixed target point offshore Leixões, Porto, Portugal.
 
-1.  **Download & Process:**
+The current implementation is based on **`xarray` + `cfgrib`**, not `pygrib`. It supports two operating modes:
 
-    * Downloads ERA5 data in monthly chunks from the CDS API (using MARS syntax rules).
+1. **Download & Process**
+   - Downloads ERA5 data from the CDS API in **monthly GRIB files**.
+   - Processes each downloaded GRIB file immediately after download.
+   - Appends the extracted point time series to a CSV file.
 
-    * Processes the resulting GRIB files to extract a pre-defined set of meteorological and oceanographic variables using Inverse Distance Weighting (IDW) for interpolation.
+2. **Extract Only**
+   - Skips downloading.
+   - Reads all GRIB files already present in the local `grib/` directory.
+   - Processes files in parallel using `ProcessPoolExecutor` with a progress bar.
 
-    * Saves the combined data into a CSV file, sorted by datetime.
+In both modes, the script extracts a predefined set of oceanographic and meteorological variables, interpolates them to the exact target coordinate using **Inverse Distance Weighting (IDW)**, and writes the merged time series to:
 
-2.  **Extract Only:**
+```text
+results/download_era5_data.csv
+```
 
-    * Skips the download phase and directly processes all available GRIB files locally.
+The output is always sorted by `datetime` in ascending order.
 
-    * Uses parallel processing with progress monitoring to efficiently extract data.
+---
 
-    * In addition to matching GRIB messages by their short names, it also extracts data using param IDs when available.
+## Current Implementation Summary
 
-## Detailed Functionality:
+This README reflects the current code behavior implemented in `download_era5_data.py`.
 
-1.  **CDS API and MARS Requests:**
+### Target point
 
-    * The request dictionary is built following the strict syntax required by the MARS system. For example, keys such as `product_type`, `format`, `param`, `year`, `month`, `day`, `time`, `area`, and `grid` must be provided in the correct format.
+The script is configured for the following fixed location:
 
-    * This script builds the request using only official ERA5 param IDs (as strings) to avoid ambiguity.
+- **Location:** Leixões Oceanic Buoy, Porto, Portugal
+- **Latitude:** `41.14833299`
+- **Longitude:** `-9.581666670`
 
-    * The `area` key is specified as `[North, West, South, East]` and `time` values are provided in "HH:00:00" format.
+### Time span used for downloads
 
-    * For further details, refer to the [MARS User Documentation](https://confluence.ecmwf.int/display/UDOC/MARS+user-documentation).
+When running in **Option 1**, the script downloads data for:
 
-2.  **Unified Variable Mapping:**
+- **Start year:** `2000`
+- **End year:** `1940`
+- **Frequency:** hourly
+- **Chunking:** monthly GRIB files
 
-    * A unified dictionary called `VARIABLES` contains both the official ERA5 param ID and the expected GRIB short name for each variable.
+When running in **Option 2**, the script **ignores** `START_YEAR` and `END_YEAR` and simply processes every GRIB file found in the `grib/` directory.
 
-    * From this mapping, a list of param IDs (`PARAM_IDS`) is derived for the CDS API request and a GRIB message key mapping (`GRIB_KEY_MAP`) is created to map the GRIB message short names to internal keys.
+---
 
-3.  **GRIB File Processing:**
+## Variables Extracted
 
-    * GRIB files are processed using the `pygrib` library.
+The script uses a central `VARIABLES` dictionary containing request codes plus matching metadata for extraction.
 
-    * For each GRIB message, the script first attempts to match the short name to our internal keys.
+| Output key | Description | Stored request code | Matching aliases / identifiers |
+|---|---|---:|---|
+| `swh` | Significant height of combined wind waves and swell | `229.140` | alias `swh`, parameter number `229`, parameter id `140229` |
+| `mwd` | Mean wave direction | `230.140` | alias `mwd`, parameter number `230`, parameter id `140230` |
+| `pp1d` | Peak wave period | `231.140` | alias `pp1d`, parameter number `231`, parameter id `140231` |
+| `wind` | 10 metre wind speed | `245.140` | alias `wind`, parameter number `245`, parameter id `140245` |
+| `dwi` | 10 metre wind direction | `249.140` | alias `dwi`, parameter number `249`, parameter id `140249` |
 
-    * If the short name is not found, it falls back to comparing the GRIB message’s parameter number (if available) to the expected param IDs.
+The final CSV columns are:
 
-    * The script uses Inverse Distance Weighting (IDW) interpolation to estimate the value at the target coordinate.
+```text
+datetime,swh,mwd,pp1d,wind,dwi
+```
 
-    * Extracted data from all GRIB files are combined into a pandas DataFrame, sorted by datetime, and exported as a CSV file.
+---
 
-4.  **Robust Error Handling and Logging:**
+## Directory Structure
 
-    * Detailed logging records each major step and any encountered issues.
+The script automatically creates the following directories if they do not already exist:
 
-    * The download process is retried multiple times with increasing delay intervals if failures occur.
+```text
+grib/
+results/
+```
 
-    * After processing, the script checks for missing monthly GRIB files and issues warnings accordingly.
+### Files produced by the script
 
-## Usage:
+- **Downloaded monthly GRIB files:**
+  ```text
+  grib/ERA5_YYYY_MM.grib
+  ```
+- **Merged CSV output:**
+  ```text
+  results/download_era5_data.csv
+  ```
+- **Log file:**
+  ```text
+  download_era5_data.log
+  ```
 
-When executed, the user is prompted to choose between:
+---
 
-* **Option 1:** Download ERA5 data via the CDS API (using MARS syntax) and process the downloaded GRIB files.
+## Core Workflow
 
-* **Option 2:** Only process existing GRIB files in the data directory.
+### 1. Download stage
 
-## Installation:
+In **Option 1**, the script:
 
-To run `download_era5_data.py`, you need to install Python 3.x and several libraries. Additionally, `ECCODES` is a crucial non-Python dependency for `pygrib`.
+- initializes a CDS API client,
+- loops through all years and months in the configured range,
+- downloads one GRIB file per month,
+- retries failed downloads up to `MAX_RETRIES = 3`,
+- waits between attempts using an increasing delay,
+- and processes each file immediately after a successful download.
 
-### 1. Set up a Python Virtual Environment and Install Dependencies:
+### Download request settings
 
-It's highly recommended to use a virtual environment to manage dependencies for this project. This isolates the project's dependencies from your system's global Python packages, preventing conflicts. You can choose between `venv` (Python's built-in tool) or `conda` (a powerful package and environment manager).
+The current code uses:
 
-#### Option A: Using `venv` (Python's built-in virtual environment tool)
+- dataset: `reanalysis-era5-single-levels`
+- `product_type = reanalysis`
+- `format = grib`
+- `variable = [spec['request_code'] for spec in VARIABLES.values()]`
+- full list of days for the month
+- all 24 hourly timestamps from `00:00` to `23:00`
+- spatial subsetting with `area`
+- regridding with `grid`
 
-1.  **Navigate to your project directory** in the terminal.
+### Spatial request window
 
-2.  **Create a virtual environment:**
+The script builds a small extraction window around the target point using:
 
-    ```bash
-    python3 -m venv era5env
-    ```
+- `BUFFER = 0.25` degrees
+- `AREA = [NORTH, WEST, SOUTH, EAST]`
+- `GRID = [0.25, 0.25]`
 
-    (You can replace `era5env` with your preferred environment name.)
+With the configured latitude and longitude, the requested bounding box is:
 
-3.  **Activate the virtual environment:**
+| Parameter | Value |
+|---|---:|
+| North | `41.39833299` |
+| South | `40.89833299` |
+| East | `-9.33166667` |
+| West | `-9.83166667` |
 
-    * **On Windows:**
+This means the script requests a very small local ERA5 grid around the point of interest and then interpolates to the exact buoy coordinate.
 
-        ```bash
-        .\era5env\Scripts\activate
-        ```
+---
 
-    * **On macOS/Linux:**
+### 2. GRIB reading stage
 
-        ```bash
-        source era5env/bin/activate
-        ```
+The extraction stage uses **`cfgrib.open_datasets(...)`** rather than assuming that a GRIB file contains a single homogeneous data cube.
 
-    Your terminal prompt should change to indicate that the virtual environment is active (e.g., `(venv_era5_data) user@host:~`).
+This is important because heterogeneous GRIB files often contain multiple internal groups with different metadata or dimensional structure.
 
-4.  **Install the required Python packages:**
+### Current `cfgrib` behavior used by the script
 
-    ```bash
-    pip install cdsapi numpy pandas pygrib tqdm eccodes
-    ```
+The script opens GRIB files with:
 
-#### Option B: Using `conda` (Recommended for scientific stack)
+- `indexpath=''` to disable `.idx` sidecar files,
+- `cache_geo_coords=True`,
+- `read_keys=['shortName', 'cfVarName', 'paramId', 'parameterNumber']`.
 
-1.  **Ensure Conda is installed:** If you don't have Conda (Miniconda or Anaconda), download and install it from the official website.
+This keeps the extraction logic close to pure file-based processing without leaving cfgrib index files behind.
 
-2.  **List existing Conda environments** (optional, to see what's already there):
+---
 
-    ```bash
-    conda info --envs
-    ```
+### 3. Variable identification logic
 
-3.  **Create a new Conda environment:**
+The script does **not** rely on only one GRIB key. Instead, it tries to identify each variable robustly by building a set of candidate strings from:
 
-    ```bash
-    conda create --name era5env python=3.9
-    ```
+- xarray data variable name,
+- `GRIB_shortName` / `shortName`,
+- `GRIB_cfVarName` / `cfVarName`,
+- `GRIB_name`, `long_name`, `standard_name`,
+- `GRIB_parameterNumber` / `parameterNumber`,
+- `GRIB_paramId` / `paramId`.
 
-    (You can choose a different Python version, e.g., `python=3.10`. `era5env` is the name of the environment.)
+It then compares those candidates to the accepted identifiers defined in `VARIABLES`:
 
-4.  **Activate the new Conda environment:**
+- alias,
+- request code,
+- parameter number,
+- parameter id.
 
-    ```bash
-    conda activate era5env
-    ```
+This makes the extraction more tolerant to differences in how `cfgrib` exposes metadata across files.
 
-    Your terminal prompt should change to `(era5env) user@host:~`.
+---
 
-5.  **Install the required Python packages into the active Conda environment:**
+### 4. Coordinate handling
 
-    ```bash
-    conda install -c conda-forge cdsapi numpy pandas pygrib tqdm eccodes
-    ```
+The script includes several defensive routines to make extraction more robust.
 
-    Using `-c conda-forge` is often recommended for scientific packages with Conda, as it provides pre-compiled binaries.
+### Coordinate name detection
 
-6.  **Verify installed packages** (optional, to confirm installation):
+It looks for latitude and longitude using common names such as:
 
-    ```bash
-    conda list
-    ```
+- `latitude`, `lat`
+- `longitude`, `lon`
 
-### 2. Set up CDS API:
+It can also deal with dimensions such as `x` and `y` where needed.
 
-To use the CDS API for downloading data, you need to register on the Copernicus Climate Data Store (CDS) and set up your personal API key.
+### Longitude normalization
 
-1.  **Register:** Go to the [Copernicus Climate Data Store website](https://cds.climate.copernicus.eu/) and create an account if you don't already have one.
+Some GRIB datasets use longitudes in:
 
-2.  **Get your API Key:** After logging in, navigate to your user profile page. You will find your UID and API key there.
+- `-180 .. 180`, while others use
+- `0 .. 360`.
 
-3.  **Configure API access:** The `cdsapi` library needs to know your UID and API key. The recommended way to do this is to create a file named `.cdsapirc` in your home directory (e.g., `C:\Users\YourUsername\.cdsapirc` on Windows, or `~/.cdsapirc` on Linux/macOS). The content of this file should be:
+The script automatically normalizes the target longitude to match the dataset convention before interpolation.
 
-    ```
-    url: [https://cds.climate.copernicus.eu/api/v2](https://cds.climate.copernicus.eu/api/v2)
-    key: <YOUR_UID>:<YOUR_API_KEY>
-    ```
+### Dimensional reduction
 
-    Replace `<YOUR_UID>` with your actual User ID and `<YOUR_API_KEY>` with your API key. For more detailed instructions, refer to the [CDS API documentation](https://cds.climate.copernicus.eu/how-to-api).
+The function `_reduce_dataarray_to_time_lat_lon(...)` reduces each xarray `DataArray` to the expected structure:
 
-## ECMWF Data Information:
+- `[time, latitude, longitude]`, or
+- `[latitude, longitude]`
 
-* **Website:** [ECMWF](https://www.ecmwf.int)
+Singleton dimensions are squeezed out. Unexpected non-singleton dimensions are reduced by selecting the first index, with that event recorded in the log.
 
-* **ERA5 reanalysis dataset:** [ERA5 Dataset](https://www.ecmwf.int/en/forecasts/dataset/ecmwf-reanalysis-v5)
+---
 
-* **Parameter reference:** [Parameter Database](https://codes.ecmwf.int/grib/param-db/)
+### 5. Time handling
 
-For more detailed information on CDS API and MARS request syntax, please refer to the [MARS User Documentation](https://confluence.ecmwf.int/display/UDOC/MARS+user-documentation).
+Time extraction is also defensive.
 
-## References and Further Reading
+The script prefers:
 
-This section provides a comprehensive list of external resources for a deeper understanding and continued learning concerning Python virtual environments and the Climate Data Store API. These references offer additional context, detailed tutorials, and official documentation to support users in their work.
+1. `valid_time`
+2. `time`
 
-**Climate Data Store (CDS) Official Portal:**
-* Copernicus Climate Change Service (C3S) Climate Data Store: <https://cds.climate.copernicus.eu/>
-* CDS API Documentation: <https://cds.climate.copernicus.eu/how-to-api>
-* Common Error Messages for CDS Requests: <https://confluence.ecmwf.int/display/CKB/Common+Error+Messages+for+CDS+Requests>
-* Recommendations and efficiency tips for C3S seasonal forecast datasets: <https://confluence.ecmwf.int/display/CKB/Recommendations+and+efficiency+tips+for+C3S+seasonal+forecast+datasets>
-* UERRA retrieval efficiency: <https://confluence.ecmwf.int/display/UER/UERRA+retrieval+efficiency>
-* ECMWF MARS Keywords: <https://confluence.ecmwf.int/display/UDOC/Keywords+in+MARS+and+Dissemination+requests>
+If the variable itself does not expose those coordinates, it falls back to the parent dataset.
 
-**`cdsapi` Python Library:**
-* `cdsapi` PyPI Project Page: <https://pypi.org/project/cdsapi/>
-* ECMWF `cdsapi` GitHub Repository: <https://github.com/ecmwf/cdsapi>
-* Copernicus Training - Reanalysis Climatology Tutorial (using `cdsapi`): <https://ecmwf-projects.github.io/copernicus-training-c3s/reanalysis-climatology.html>
-* `cdsapi` Example ERA5 Python Script: <https://github.com/ecmwf/cdsapi/blob/master/example-era5.py>
+Returned timestamps are converted with:
 
-**`ecCodes` Installation and Usage:**
-* `ecCodes` Installation Documentation: <https://confluence.ecmwf.int/display/ECC/ecCodes+installation>
-* `ecCodes` Python Bindings GitHub Repository: <https://github.com/ecmwf/eccodes-python>
-* `ecCodes` PyPI Project Page: <https://pypi.org/project/eccodes/>
+```python
+pd.to_datetime(..., errors='coerce', format='mixed')
+```
+
+When the number of timestamps and the number of interpolated values do not match exactly, the script attempts to realign them by:
+
+- repeating a single timestamp if needed,
+- repeating a single value if needed,
+- or truncating both arrays to the minimum common length.
+
+---
+
+### 6. IDW interpolation method
+
+The script interpolates from the ERA5 grid to the exact target point using **Inverse Distance Weighting (IDW)** with:
+
+```text
+IDW_POWER = 2
+```
+
+### IDW behavior implemented in the code
+
+1. The script builds latitude/longitude grids from the dataset coordinates.
+2. It computes planar distance in degree space from each grid point to the target point.
+3. If the target point coincides exactly with a grid point (`distance < 1e-12`), the script returns that grid-point value directly.
+4. Otherwise, it computes standard IDW weights:
+
+```text
+weight = 1 / distance^power
+```
+
+5. Only finite values contribute to the interpolation.
+6. The resulting interpolated value is stored for each time step.
+
+This is a pragmatic point-extraction approach for the small local grid requested by the script.
+
+---
+
+### 7. Parallel processing in Extract Only mode
+
+In **Option 2**, the script processes all local GRIB files in parallel using:
+
+- `ProcessPoolExecutor`
+- `max_workers = os.cpu_count() or 1`
+- a progress bar from `tqdm`
+
+Each file is processed with a timeout of:
+
+```text
+TIMEOUT_PER_FILE = 180 seconds
+```
+
+If a file exceeds that limit, the future is cancelled and the timeout event is written to the log.
+
+The script also forces the multiprocessing start method to:
+
+```python
+spawn
+```
+
+when run as the main program. This is explicitly intended to improve compatibility with C-library-based packages on Windows.
+
+---
+
+### 8. CSV generation logic
+
+### Option 1: Download & Process
+
+In Option 1, the script:
+
+- creates the CSV header if the file does not yet exist,
+- appends each monthly processed DataFrame to the CSV,
+- and at the end re-reads the full CSV, sorts by `datetime`, and writes it back.
+
+### Option 2: Extract Only
+
+In Option 2, the script:
+
+- deletes any existing output CSV before processing,
+- processes all GRIB files found locally,
+- concatenates all extracted DataFrames,
+- converts `datetime` to pandas datetime,
+- sorts the merged result,
+- and writes the final CSV once.
+
+---
+
+## Configuration Parameters
+
+The key configurable constants in the current code are:
+
+| Name | Value | Meaning |
+|---|---:|---|
+| `LONGITUDE` | `-9.581666670` | Target longitude |
+| `LATITUDE` | `41.14833299` | Target latitude |
+| `START_YEAR` | `1940` | First year used in Option 1 |
+| `END_YEAR` | `2025` | Last year used in Option 1 |
+| `BUFFER` | `0.25` | Bounding-box half-size in degrees |
+| `GRID` | `[0.25, 0.25]` | Requested grid resolution |
+| `REQUEST_DELAY` | `60` | Delay between download attempts / monthly requests |
+| `MAX_RETRIES` | `3` | Maximum number of download attempts |
+| `IDW_POWER` | `2` | Inverse distance weighting exponent |
+| `TIMEOUT_PER_FILE` | `180` | Timeout per GRIB file in Option 2 |
+| `GRIB_EXTENSIONS` | `.grib`, `.grib2`, `.grb`, `.grb2` | File extensions accepted in local processing |
+| `LOG_FILE` | `download_era5_data.log` | Log file path |
+
+---
+
+## Requirements
+
+### Python packages
+
+The current script requires these Python packages:
+
+- `numpy`
+- `pandas`
+- `tqdm`
+- `xarray`
+- `cfgrib`
+- `eccodes`
+- `cdsapi` *(only required if you use Option 1)*
+
+A straightforward installation is:
+
+```bash
+pip install numpy pandas tqdm xarray cfgrib eccodes cdsapi
+```
+
+If you only want to process local GRIB files and do not need downloading, the script can still run without `cdsapi`, because that import is optional in the code. However, `xarray`, `cfgrib`, and `eccodes` remain essential for GRIB extraction.
+
+---
+
+## CDS API setup
+
+To use **Option 1**, you need CDS API credentials.
+
+1. Create an account at the Copernicus Climate Data Store.
+2. Obtain your API credentials.
+3. Create a `.cdsapirc` file in your home directory.
+
+Typical content:
+
+```text
+url: https://cds.climate.copernicus.eu/api/v2
+key: <YOUR_UID>:<YOUR_API_KEY>
+```
+
+Replace `<YOUR_UID>` and `<YOUR_API_KEY>` with your own credentials.
+
+---
+
+## How to Run
+
+Run the script from the project directory:
+
+```bash
+python download_era5_data.py
+```
+
+At runtime, the script prompts:
+
+```text
+SELECT YOUR OPTION:
+1) Download ERA5 data from CDS API and process GRIB files;
+2) Only extract data from existing GRIB files.
+Choose (1 or 2):
+```
+
+### Option 1 — Download and process
+
+Choose `1` when you want the script to:
+
+- download monthly ERA5 GRIB files,
+- process each downloaded file,
+- and write the final CSV output.
+
+### Option 2 — Process existing GRIB files only
+
+Choose `2` when you already have GRIB files in `grib/` and only want extraction.
+
+This mode:
+
+- ignores the configured year range,
+- scans the `grib/` directory for supported file extensions,
+- processes files in parallel,
+- and rebuilds the output CSV from scratch.
+
+---
+
+## Output Format
+
+The resulting CSV contains one row per timestamp and the following fields:
+
+| Column | Meaning |
+|---|---|
+| `datetime` | Timestamp of the extracted ERA5 data |
+| `swh` | Significant wave height |
+| `mwd` | Mean wave direction |
+| `pp1d` | Peak wave period |
+| `wind` | 10 metre wind speed |
+| `dwi` | 10 metre wind direction |
+
+Missing or non-finite values are written as empty cells / null-equivalent CSV entries.
+
+---
+
+## Logging and Diagnostics
+
+The script writes a log file named:
+
+```text
+download_era5_data.log
+```
+
+The log records:
+
+- CDS client initialization issues,
+- download attempts and retries,
+- skipped or unrecognized variables,
+- dimension-reduction events,
+- file-processing timeouts,
+- GRIB-opening errors,
+- CSV sorting issues,
+- and total processing time.
+
+At the end of execution, the script prints total runtime to the console.
+
+---
+
+## Important Notes
+
+### 1. This is no longer a `pygrib` workflow
+
+The current script is based on:
+
+- `xarray`
+- `cfgrib`
+- `eccodes`
+
+Any older documentation referring to `pygrib` is outdated for this codebase.
+
+### 2. The script is designed for a fixed point
+
+The target latitude and longitude are hard-coded. To use another site, change:
+
+- `LATITUDE`
+- `LONGITUDE`
+
+and, if desired, also adjust:
+
+- `BUFFER`
+- `START_YEAR`
+- `END_YEAR`
+- output directory names
+
+### 3. Option 2 replaces previous CSV output
+
+In Extract Only mode, the script deletes any existing `results/download_era5_data.csv` before rebuilding it.
+
+### 4. GRIB heterogeneity is handled explicitly
+
+Using `cfgrib.open_datasets(...)` allows the script to process files that contain multiple internal GRIB groups instead of assuming a single cube.
+
+---
+
+## Minimal Example Workflow
+
+### First-time setup
+
+```bash
+pip install numpy pandas tqdm xarray cfgrib eccodes cdsapi
+```
+
+Create folders if needed:
+
+```bash
+mkdir grib
+mkdir results
+```
+
+### Download and process ERA5 data
+
+```bash
+python download_era5_data.py
+```
+
+Then choose:
+
+```text
+1
+```
+
+### Process GRIB files already stored locally
+
+```bash
+python download_era5_data.py
+```
+
+Then choose:
+
+```text
+2
+```
+
+---
+
+## Suggested Future README Extensions
+
+If you want this documentation to become even more complete, the next logical additions would be:
+
+- a sample excerpt of the output CSV,
+- a section on typical `cfgrib` / `eccodes` installation issues,
+- notes on CDS API quotas and rate limits,
+- and a section describing how to adapt the script for multiple stations instead of a single fixed point.
