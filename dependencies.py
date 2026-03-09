@@ -1,116 +1,237 @@
 # -*- coding: utf-8 -*-
 """
-This script checks for the presence of essential Python libraries
-required to run 'download_era5 (swh mwd pp1d wind dwi).py'.
-It also lists the installed version number for each library.
-It provides guidance on installing missing libraries and
-notes specific requirements like ECCODES for pygrib.
+Dependency checker for download_era5_data.py
+===========================================
+
+This script verifies whether the Python packages required by
+'download_era5_data.py' are installed and reports their versions.
+It distinguishes between:
+
+- Core extraction dependencies (needed to read/process GRIB files)
+- Optional download dependency (needed only for CDS API downloads)
+- Standard-library modules used by the script
+
+The current ERA5 workflow is based on:
+    xarray + cfgrib + eccodes
+and no longer on pygrib.
 """
 
-import sys
-import os
-import importlib.metadata # Used to retrieve installed package versions
+from __future__ import annotations
 
-def check_library(library_name, pypi_name=None, extra_info=None):
-    """
-    Attempts to import a library, gets its installed version, and prints its status.
-    Args:
-        library_name (str): The name of the library to import (e.g., 'pandas').
-        pypi_name (str, optional): The name of the package on PyPI if different
-                                   from library_name (e.g., 'cdsapi'),
-                                   or includes a suggested version for installation.
-        extra_info (str, optional): Additional information or troubleshooting
-                                    tips for the library.
-    """
-    # Extract package name from pypi_name if it includes a version (e.g., 'cdsapi==0.7.6')
-    actual_pypi_name = pypi_name.split('==')[0] if pypi_name else library_name
-    install_suggestion = pypi_name if pypi_name else library_name # Use the full string for pip install
+import importlib
+import importlib.metadata
+import sys
+from dataclasses import dataclass
+from typing import Optional
+
+
+@dataclass(frozen=True)
+class Dependency:
+    """Description of one dependency to be checked."""
+    import_name: str
+    package_name: Optional[str] = None
+    install_name: Optional[str] = None
+    category: str = "Python package"
+    required_for: str = "General use"
+    notes: Optional[str] = None
+
+
+def get_version(package_name: str) -> str:
+    """Return installed distribution version when available."""
+    try:
+        return importlib.metadata.version(package_name)
+    except importlib.metadata.PackageNotFoundError:
+        return "installed, version metadata not found"
+    except Exception as exc:
+        return f"installed, but version lookup failed ({exc})"
+
+
+def check_dependency(dep: Dependency) -> bool:
+    """Check whether one dependency can be imported."""
+    package_name = dep.package_name or dep.import_name
+    install_name = dep.install_name or package_name
 
     try:
-        # Attempt to import the library
-        __import__(library_name)
-        
-        # Try to get the installed version
-        installed_version = "N/A" # Default if version can't be found or for built-in modules
-        try:
-            # Use the actual package name for importlib.metadata
-            installed_version = importlib.metadata.version(actual_pypi_name)
-        except importlib.metadata.PackageNotFoundError:
-            # This can happen for some built-in modules or if metadata is missing
-            pass
-        except Exception as e:
-            # Catch any other unexpected errors during version retrieval
-            installed_version = f"Error: {e}"
-
-        print(f"✅ '{library_name}' is installed. Version: {installed_version}")
-
+        importlib.import_module(dep.import_name)
+        version = get_version(package_name)
+        print(f"✅ {dep.import_name:<20} | {version}")
+        print(f"   Role: {dep.required_for}")
+        if dep.notes:
+            print(f"   Note: {dep.notes}")
+        return True
     except ImportError:
-        print(f"❌ '{library_name}' is NOT installed.")
-        print(f"   Please install it using pip: pip install {install_suggestion}")
-        if extra_info:
-            print(f"   Note: {extra_info}")
-    except Exception as e:
-        print(f"⚠️  An unexpected error occurred while checking '{library_name}': {e}")
-        print(f"   Details: {e}")
+        print(f"❌ {dep.import_name:<20} | NOT INSTALLED")
+        print(f"   Role: {dep.required_for}")
+        print(f"   Install: pip install {install_name}")
+        if dep.notes:
+            print(f"   Note: {dep.notes}")
+        return False
+    except Exception as exc:
+        print(f"⚠️  {dep.import_name:<20} | CHECK FAILED ({exc})")
+        print(f"   Role: {dep.required_for}")
+        if dep.notes:
+            print(f"   Note: {dep.notes}")
+        return False
 
-def main():
-    """
-    Main function to run all library checks.
-    """
-    print("\n" + "="*60)
-    print("--- Checking Essential Python Libraries and Versions ---".center(60))
-    print("This script will verify if the necessary libraries for".center(60))
-    print("'download_era5 (swh mwd pp1d wind dwi).py' are installed and list their versions.".center(60))
-    print("="*60 + "\n")
 
-    # List of libraries to check: (library_name, pypi_name_for_install_and_version_check, extra_info)
-    # The pypi_name_for_install_and_version_check should include '==' if a specific version
-    # is suggested for installation, but the check will only report the installed version.
-    libraries_to_check = [
-        # Core dependencies from the original script
-        ("cdsapi", "cdsapi==1.1.0", "Ensure your ~/.cdsapirc file is configured correctly for CDS API access."),
-        ("pygrib", "pygrib==2.1.6", "pygrib requires ECCODES to be installed and configured on your system (e.g., via apt, brew, or source). Refer to the pygrib documentation for details. If you encounter 'numpy.dtype size changed' errors, ensure pygrib and numpy are compatible versions."),
-        ("pandas", "pandas==2.3.1", None),
-        ("numpy", "numpy==2.3.2", "If you encounter 'numpy.dtype size changed' errors, ensure pygrib is compatible with your NumPy version."),
-        ("tqdm", "tqdm==4.67.1", None),
+def print_header(title: str) -> None:
+    print("\n" + "=" * 78)
+    print(title)
+    print("=" * 78)
 
-        # New packages to check
-        ("fpdf", "fpdf==1.7.2", "Used for generating PDF documents."),
-        ("matplotlib", "matplotlib==3.10.3", "Used for plotting and visualization."),
-        ("scipy", "scipy==1.16.0", "Scientific computing library, often used with numpy."),
-        ("windrose", "windrose==1.9.2", "Specialized library for plotting windrose diagrams."),
 
-        # Standard Python libraries (no pypi_name or version needed)
-        ("logging", None, "This is a standard Python library and should be available by default."),
-        ("concurrent.futures", None, "This is a standard Python library for parallelism."),
-        ("multiprocessing", None, "This is a standard Python library for parallelism."),
-        ("calendar", None, "This is a standard Python library for calendar-related functions."),
-        ("sys", None, "This is a standard Python library for system-specific parameters and functions."),
-        ("os", None, "This is a standard Python library for interacting with the operating system."),
-        ("time", None, "This is a standard Python library for time-related functions."),
+def main() -> None:
+    print_header("Checking dependencies for download_era5_data.py")
+    print(
+        "This script checks the packages used by the current ERA5 workflow based on\n"
+        "xarray + cfgrib + eccodes, and reports installed versions when available."
+    )
+
+    core_dependencies = [
+        Dependency(
+            import_name="numpy",
+            install_name="numpy",
+            category="Core",
+            required_for="Numerical operations and interpolation support",
+        ),
+        Dependency(
+            import_name="pandas",
+            install_name="pandas",
+            category="Core",
+            required_for="Datetime handling and CSV output",
+        ),
+        Dependency(
+            import_name="xarray",
+            install_name="xarray",
+            category="Core",
+            required_for="Reading and handling GRIB datasets through cfgrib",
+        ),
+        Dependency(
+            import_name="cfgrib",
+            install_name="cfgrib",
+            category="Core",
+            required_for="Opening GRIB files with xarray",
+            notes="Requires ecCodes support to read GRIB files correctly.",
+        ),
+        Dependency(
+            import_name="eccodes",
+            install_name="eccodes",
+            category="Core",
+            required_for="Backend library used by cfgrib for GRIB decoding",
+            notes="Depending on platform, you may need the ecCodes binaries/libraries available on the system as well.",
+        ),
+        Dependency(
+            import_name="tqdm",
+            install_name="tqdm",
+            category="Core",
+            required_for="Progress bars during download and extraction",
+        ),
     ]
 
-    for lib, pypi, info in libraries_to_check:
-        check_library(lib, pypi, info)
-    
-    print("\n" + "="*60)
-    print("Library Check Complete.".center(60))
-    print("If any '❌' or '⚠️' symbols appeared, please address the issues.".center(60))
-    print("Remember to activate your virtual environment (venv or conda) before installing/reinstalling packages.".center(60))
-    print("="*60 + "\n")
+    optional_dependencies = [
+        Dependency(
+            import_name="cdsapi",
+            install_name="cdsapi",
+            category="Optional",
+            required_for="Option 1 only: downloading ERA5 data from the CDS API",
+            notes="Also requires a valid ~/.cdsapirc (or equivalent) CDS API configuration.",
+        ),
+    ]
+
+    standard_library_dependencies = [
+        Dependency(
+            import_name="calendar",
+            category="Standard library",
+            required_for="Monthly day counting",
+            notes="Included with Python.",
+        ),
+        Dependency(
+            import_name="logging",
+            category="Standard library",
+            required_for="Execution logging",
+            notes="Included with Python.",
+        ),
+        Dependency(
+            import_name="multiprocessing",
+            category="Standard library",
+            required_for="Spawn start method / process management",
+            notes="Included with Python.",
+        ),
+        Dependency(
+            import_name="concurrent.futures",
+            category="Standard library",
+            required_for="Parallel GRIB processing in extract-only mode",
+            notes="Included with Python.",
+        ),
+        Dependency(
+            import_name="os",
+            category="Standard library",
+            required_for="Filesystem operations",
+            notes="Included with Python.",
+        ),
+        Dependency(
+            import_name="sys",
+            category="Standard library",
+            required_for="Program termination and interpreter interaction",
+            notes="Included with Python.",
+        ),
+        Dependency(
+            import_name="time",
+            category="Standard library",
+            required_for="Retries, delays and elapsed-time measurement",
+            notes="Included with Python.",
+        ),
+        Dependency(
+            import_name="importlib.metadata",
+            package_name="importlib-metadata",
+            category="Standard library",
+            required_for="Version reporting in this checker",
+            notes="Built into Python 3.8+; older Python versions may require importlib-metadata.",
+        ),
+    ]
+
+    missing_core = 0
+    missing_optional = 0
+    missing_stdlib = 0
+
+    print_header("Core dependencies (needed to process GRIB files)")
+    for dep in core_dependencies:
+        ok = check_dependency(dep)
+        if not ok:
+            missing_core += 1
+
+    print_header("Optional dependency (needed only for CDS downloads)")
+    for dep in optional_dependencies:
+        ok = check_dependency(dep)
+        if not ok:
+            missing_optional += 1
+
+    print_header("Standard library modules")
+    for dep in standard_library_dependencies:
+        ok = check_dependency(dep)
+        if not ok:
+            missing_stdlib += 1
+
+    print_header("Summary")
+    print(f"Core missing:      {missing_core}")
+    print(f"Optional missing:  {missing_optional}")
+    print(f"Stdlib missing:    {missing_stdlib}")
+
+    if missing_core == 0:
+        print("Result: GRIB extraction prerequisites appear to be available.")
+    else:
+        print("Result: one or more core packages required for GRIB extraction are missing.")
+
+    if missing_optional == 0:
+        print("CDS download support: available.")
+    else:
+        print("CDS download support: not fully available (Option 2 may still work).")
+
+    print(
+        "\nRecommended installation command for the current workflow:\n"
+        "pip install numpy pandas xarray cfgrib eccodes tqdm cdsapi"
+    )
+
 
 if __name__ == "__main__":
-    # It's good practice to set the multiprocessing start method early,
-    # especially for applications using pygrib which can have C-library interactions.
-    try:
-        import multiprocessing
-        # 'spawn' is generally safer for cross-platform compatibility and C extensions
-        multiprocessing.set_start_method("spawn", force=True)
-    except RuntimeError:
-        # This can happen if set_start_method is called more than once
-        # or if the context is already set.
-        pass
-    except ImportError:
-        print("Warning: 'multiprocessing' library not found. Parallel processing features might be unavailable.")
-
     main()
