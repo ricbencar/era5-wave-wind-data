@@ -535,12 +535,3 @@ Then choose:
 ```
 
 ---
-
-## Suggested Future README Extensions
-
-If you want this documentation to become even more complete, the next logical additions would be:
-
-- a sample excerpt of the output CSV,
-- a section on typical `cfgrib` / `eccodes` installation issues,
-- notes on CDS API quotas and rate limits,
-- and a section describing how to adapt the script for multiple stations instead of a single fixed point.
