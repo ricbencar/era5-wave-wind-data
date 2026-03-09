@@ -42,8 +42,8 @@ The script is configured for the following fixed location:
 
 When running in **Option 1**, the script downloads data for:
 
-- **Start year:** `2000`
-- **End year:** `1940`
+- **Start year:** `1940`
+- **End year:** `2025`
 - **Frequency:** hourly
 - **Chunking:** monthly GRIB files
 
