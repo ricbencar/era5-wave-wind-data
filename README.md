@@ -50,7 +50,7 @@ ERA5 should nevertheless be understood for what it is: a high-quality **global r
 
 ## 3. ERA5 data architecture relevant to this application
 
-According to the supplied ECMWF/Copernicus documentation, ERA5 is produced with 4D-Var data assimilation in IFS CY41R2 and 137 hybrid sigma/pressure model levels. Surface and single-level parameters include atmospheric 2D quantities and ocean-wave outputs from the coupled wave model. ERA5 contains an hourly HRES realization and a reduced-resolution 10-member ensemble. The original public ERA5 release started in 1979, but the back extension to 1940 is now available in the documented product family. Daily ERA5T updates are typically available about 5 days behind real time, and final ERA5 normally replaces ERA5T about 2 to 3 months later. The supplied documentation also records recent cases where final ERA5 differed from ERA5T after later corrections, which is important when engineering studies require strict data traceability.
+According to the ECMWF/Copernicus documentation, ERA5 is produced with 4D-Var data assimilation in IFS CY41R2 and 137 hybrid sigma/pressure model levels. Surface and single-level parameters include atmospheric 2D quantities and ocean-wave outputs from the coupled wave model. ERA5 contains an hourly HRES realization and a reduced-resolution 10-member ensemble. The original public ERA5 release started in 1979, but the back extension to 1940 is now available in the documented product family. Daily ERA5T updates are typically available about 5 days behind real time, and final ERA5 normally replaces ERA5T about 2 to 3 months later. The documentation also records recent cases where final ERA5 differed from ERA5T after later corrections, which is important when engineering studies require strict data traceability.
 
 For data delivery, ECMWF distinguishes between native archived products and CDS-accessible products interpolated to regular latitude/longitude grids. The documentation notes that wave data are produced on a wave-model grid distinct from the atmospheric model grid, while CDS-accessible ERA5 data are supplied on regular latitude/longitude grids via ECMWF interpolation software. For engineering workflows, this means the retrieved grid is already a delivered analysis product, not the native internal model grid.
 
@@ -194,9 +194,9 @@ For the small local stencil used by this tool, this is a pragmatic and numerical
 
 ---
 
-## 6. ERA5 wave and wind parameters available in the supplied parameter catalogue
+## 6. ERA5 wave and wind parameters available in the parameter catalogue
 
-The supplied `parameters.xlsx` file contains a much broader ERA5 wave/wind catalogue than the five variables currently extracted by the script. For engineering use, the most relevant families are summarized below.
+The `parameters.xlsx` file contains a much broader ERA5 wave/wind catalogue than the five variables currently extracted by the script. For engineering use, the most relevant families are summarized below.
 
 ### 6.1 Total sea-state parameters
 
@@ -292,7 +292,7 @@ datetime,swh,mwd,pp1d,wind,dwi
 
 ### Important engineering note on the wind-speed field
 
-The script is currently configured to request the parameter mapped by code `245.140` and paramId `140245`, which the supplied catalogue identifies as `wind` / **10 metre wind speed**. This is not the same identifier as `10si` / param number `207`, even though both represent 10 m wind speed products in the catalogue. If strict consistency with a prior atmospheric-wind workflow is required, engineers should verify whether `140245` is the intended wind product for their application before using the output in downstream design calculations.
+The script is currently configured to request the parameter mapped by code `245.140` and paramId `140245`, which the catalogue identifies as `wind` / **10 metre wind speed**. This is not the same identifier as `10si` / param number `207`, even though both represent 10 m wind speed products in the catalogue. If strict consistency with a prior atmospheric-wind workflow is required, engineers should verify whether `140245` is the intended wind product for their application before using the output in downstream design calculations.
 
 ---
 
@@ -342,7 +342,7 @@ For operational workflows, engineers should distinguish between:
 - **ERA5T**: preliminary near-real-time data;
 - **final ERA5**: later consolidated and quality-checked product.
 
-The supplied ECMWF documentation notes that final ERA5 normally replaces ERA5T after about two to three months, and also documents specific periods when later corrections changed the final product. For bankable studies, litigation-sensitive work, or contractual design documentation, it is good practice to archive the data acquisition date and to avoid treating recent ERA5T data as fully frozen.
+The ECMWF documentation notes that final ERA5 normally replaces ERA5T after about two to three months, and also documents specific periods when later corrections changed the final product. For bankable studies, litigation-sensitive work, or contractual design documentation, it is good practice to archive the data acquisition date and to avoid treating recent ERA5T data as fully frozen.
 
 ---
 
@@ -725,7 +725,7 @@ For formal design studies, also archive the CDS dataset citation and the ERA5 do
 
 ### Attribution note
 
-The supplied ECMWF documentation states that users should cite the relevant CDS catalogue entry and provide clear attribution to the Copernicus programme and the data products used. This should be followed in formal reports, papers and contractual engineering deliverables that rely on ERA5-derived inputs.
+The ECMWF documentation states that users should cite the relevant CDS catalogue entry and provide clear attribution to the Copernicus programme and the data products used. This should be followed in formal reports, papers and contractual engineering deliverables that rely on ERA5-derived inputs.
 
 ---
 
