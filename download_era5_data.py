@@ -316,35 +316,35 @@ Usage notes
 - A configured CDS API key is required by cdsapi.Client.
 """.strip()
 
-DEFAULT_WINDOW_WIDTH = 920
-DEFAULT_WINDOW_HEIGHT = 560
-DEFAULT_WINDOW_MIN_WIDTH = DEFAULT_WINDOW_WIDTH
-DEFAULT_WINDOW_MIN_HEIGHT = DEFAULT_WINDOW_HEIGHT
+DEFAULT_WINDOW_WIDTH = 980
+DEFAULT_WINDOW_HEIGHT = 700
+DEFAULT_WINDOW_MIN_WIDTH = 940
+DEFAULT_WINDOW_MIN_HEIGHT = 660
 
-HEADER_HEIGHT = 84
-BODY_FRAME_WIDTH = 896
-BODY_FRAME_HEIGHT = 386
-FOOTER_HEIGHT = 54
+HEADER_HEIGHT = 94
+BODY_FRAME_WIDTH = DEFAULT_WINDOW_WIDTH - 24
+BODY_FRAME_HEIGHT = DEFAULT_WINDOW_HEIGHT - HEADER_HEIGHT - 72
+FOOTER_HEIGHT = 72
 
-RUN_LEFT_WIDTH = 536
-RUN_RIGHT_WIDTH = 318
-RUN_PANEL_HEIGHT = 300
+RUN_LEFT_WIDTH = 560
+RUN_RIGHT_WIDTH = 350
+RUN_PANEL_HEIGHT = 430
 POINT_CARD_WIDTH = RUN_LEFT_WIDTH
-POINT_CARD_HEIGHT = 190
+POINT_CARD_HEIGHT = 245
 ACTION_CARD_WIDTH = RUN_RIGHT_WIDTH
-ACTION_CARD_HEIGHT = 150
+ACTION_CARD_HEIGHT = 205
 PROGRESS_CARD_WIDTH = RUN_RIGHT_WIDTH
-PROGRESS_CARD_HEIGHT = 150
+PROGRESS_CARD_HEIGHT = 190
 
-LOG_FRAME_WIDTH = BODY_FRAME_WIDTH - 56
-LOG_FRAME_HEIGHT = BODY_FRAME_HEIGHT - 78
+LOG_FRAME_WIDTH = BODY_FRAME_WIDTH - 48
+LOG_FRAME_HEIGHT = BODY_FRAME_HEIGHT - 70
 LOG_BOX_WIDTH_CHARS = 104
-LOG_BOX_HEIGHT_LINES = 17
-INSTRUCTIONS_FRAME_WIDTH = BODY_FRAME_WIDTH - 56
-INSTRUCTIONS_FRAME_HEIGHT = BODY_FRAME_HEIGHT - 78
+LOG_BOX_HEIGHT_LINES = 20
+INSTRUCTIONS_FRAME_WIDTH = BODY_FRAME_WIDTH - 48
+INSTRUCTIONS_FRAME_HEIGHT = BODY_FRAME_HEIGHT - 70
 INSTRUCTIONS_BOX_WIDTH_CHARS = 104
-INSTRUCTIONS_BOX_HEIGHT_LINES = 17
-FOOTER_WRAP_LENGTH = 880
+INSTRUCTIONS_BOX_HEIGHT_LINES = 20
+FOOTER_WRAP_LENGTH = DEFAULT_WINDOW_MIN_WIDTH - 32
 
 
 # -----------------------------------------------------------------------------
@@ -1181,8 +1181,7 @@ class Era5DownloaderGUI:
         self.root.title("ERA5 Single-Point CSV Downloader")
         self.root.geometry(f"{DEFAULT_WINDOW_WIDTH}x{DEFAULT_WINDOW_HEIGHT}")
         self.root.minsize(DEFAULT_WINDOW_MIN_WIDTH, DEFAULT_WINDOW_MIN_HEIGHT)
-        self.root.maxsize(DEFAULT_WINDOW_WIDTH, DEFAULT_WINDOW_HEIGHT)
-        self.root.resizable(False, False)
+        self.root.resizable(True, True)
 
         self.message_queue: queue.Queue[tuple[str, dict[str, object]]] = queue.Queue()
         self.worker_thread: Optional[threading.Thread] = None
@@ -1216,13 +1215,14 @@ class Era5DownloaderGUI:
 
         self.root.configure(bg="#eef3f8")
         style.configure("TNotebook", background="#eef3f8", borderwidth=0)
-        style.configure("TNotebook.Tab", padding=(16, 8), font=("Segoe UI", 10, "bold"))
-        style.configure("Card.TLabelframe", padding=10)
-        style.configure("Card.TLabelframe.Label", font=("Segoe UI", 10, "bold"))
-        style.configure("Primary.TButton", font=("Segoe UI", 10, "bold"))
-        style.configure("TButton", padding=(10, 6), font=("Segoe UI", 10))
-        style.configure("TLabel", font=("Segoe UI", 10))
-        style.configure("Small.TLabel", font=("Segoe UI", 9))
+        style.configure("TNotebook.Tab", padding=(18, 10), font=("Segoe UI", 11, "bold"))
+        style.configure("Card.TLabelframe", padding=12)
+        style.configure("Card.TLabelframe.Label", font=("Segoe UI", 11, "bold"))
+        style.configure("Primary.TButton", font=("Segoe UI", 11, "bold"))
+        style.configure("TButton", padding=(12, 8), font=("Segoe UI", 11))
+        style.configure("TLabel", font=("Segoe UI", 11))
+        style.configure("Small.TLabel", font=("Segoe UI", 10))
+        style.configure("TEntry", padding=(6, 5), font=("Segoe UI", 11))
 
     @staticmethod
     def _freeze_widget_size(widget: object) -> None:
@@ -1246,7 +1246,7 @@ class Era5DownloaderGUI:
             text="ERA5 Single-Point CSV Downloader",
             bg="#1f3b5b",
             fg="white",
-            font=("Segoe UI", 18, "bold"),
+            font=("Segoe UI", 20, "bold"),
             anchor="w",
         ).pack(fill="x")
         tk.Label(
@@ -1257,7 +1257,7 @@ class Era5DownloaderGUI:
             ),
             bg="#1f3b5b",
             fg="#d7e6f5",
-            font=("Segoe UI", 10),
+            font=("Segoe UI", 11),
             anchor="w",
             justify="left",
         ).pack(fill="x", pady=(4, 0))
@@ -1269,16 +1269,14 @@ class Era5DownloaderGUI:
             width=BODY_FRAME_WIDTH,
             height=BODY_FRAME_HEIGHT,
         )
-        outer.pack(fill="both", expand=False)
-        self._freeze_widget_size(outer)
+        outer.pack(fill="both", expand=True)
 
         self.notebook = ttk.Notebook(
             outer,
             width=BODY_FRAME_WIDTH - 24,
             height=BODY_FRAME_HEIGHT - 24,
         )
-        self.notebook.pack(fill="both", expand=False)
-        self._freeze_widget_size(self.notebook)
+        self.notebook.pack(fill="both", expand=True)
 
         self.run_tab = ttk.Frame(self.notebook, padding=14)
         self.log_tab = ttk.Frame(self.notebook, padding=14)
@@ -1292,18 +1290,19 @@ class Era5DownloaderGUI:
         self._build_instructions_tab()
 
     def _build_run_tab(self) -> None:
-        self.run_tab.columnconfigure(0, minsize=RUN_LEFT_WIDTH, weight=0)
+        self.run_tab.columnconfigure(0, minsize=RUN_LEFT_WIDTH, weight=1)
         self.run_tab.columnconfigure(1, minsize=RUN_RIGHT_WIDTH, weight=0)
-        self.run_tab.rowconfigure(0, minsize=RUN_PANEL_HEIGHT, weight=0)
+        self.run_tab.rowconfigure(0, minsize=RUN_PANEL_HEIGHT, weight=1)
 
         left = ttk.Frame(self.run_tab, width=RUN_LEFT_WIDTH, height=RUN_PANEL_HEIGHT)
         right = ttk.Frame(self.run_tab, width=RUN_RIGHT_WIDTH, height=RUN_PANEL_HEIGHT)
-        left.grid(row=0, column=0, sticky="nw", padx=(0, 8))
-        right.grid(row=0, column=1, sticky="nw", padx=(8, 0))
-        self._freeze_widget_size(left)
-        self._freeze_widget_size(right)
-        left.columnconfigure(0, minsize=RUN_LEFT_WIDTH, weight=0)
-        right.columnconfigure(0, minsize=RUN_RIGHT_WIDTH, weight=0)
+        left.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
+        right.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
+        left.columnconfigure(0, minsize=RUN_LEFT_WIDTH, weight=1)
+        left.rowconfigure(0, weight=0)
+        right.columnconfigure(0, minsize=RUN_RIGHT_WIDTH, weight=1)
+        right.rowconfigure(0, weight=0)
+        right.rowconfigure(1, weight=1)
 
         self._build_point_card(left)
         self._build_action_card(right)
@@ -1317,9 +1316,9 @@ class Era5DownloaderGUI:
             width=POINT_CARD_WIDTH,
             height=POINT_CARD_HEIGHT,
         )
-        point_card.grid(row=0, column=0, sticky="nw")
-        self._freeze_widget_size(point_card)
-        point_card.columnconfigure(1, minsize=300, weight=0)
+        point_card.grid(row=0, column=0, sticky="new")
+        point_card.columnconfigure(0, weight=0)
+        point_card.columnconfigure(1, minsize=300, weight=1)
 
         fields = [
             ("Longitude", self.longitude_var),
@@ -1329,10 +1328,10 @@ class Era5DownloaderGUI:
         ]
         for row_index, (label, variable) in enumerate(fields):
             ttk.Label(point_card, text=label).grid(row=row_index, column=0, sticky="w", padx=(0, 8), pady=6)
-            ttk.Entry(point_card, textvariable=variable, width=24).grid(
+            ttk.Entry(point_card, textvariable=variable, width=26).grid(
                 row=row_index,
                 column=1,
-                sticky="w",
+                sticky="ew",
                 pady=6,
             )
 
@@ -1352,9 +1351,8 @@ class Era5DownloaderGUI:
             width=ACTION_CARD_WIDTH,
             height=ACTION_CARD_HEIGHT,
         )
-        action_card.grid(row=0, column=0, sticky="nw")
-        self._freeze_widget_size(action_card)
-        action_card.columnconfigure(0, minsize=ACTION_CARD_WIDTH - 28, weight=0)
+        action_card.grid(row=0, column=0, sticky="new")
+        action_card.columnconfigure(0, minsize=ACTION_CARD_WIDTH - 28, weight=1)
 
         self.start_button = ttk.Button(
             action_card,
@@ -1368,11 +1366,11 @@ class Era5DownloaderGUI:
             text="Open Log tab",
             command=lambda: self.notebook.select(self.log_tab),
         ).grid(row=1, column=0, sticky="ew", pady=4)
-        ttk.Button(action_card, text="Quit", command=self.root.destroy).grid(
+        ttk.Button(action_card, text="Quit", command=self._on_close).grid(
             row=2,
             column=0,
             sticky="ew",
-            pady=4,
+            pady=(4, 0),
         )
 
     def _build_progress_card(self, parent: "ttk.Frame") -> None:
@@ -1383,8 +1381,7 @@ class Era5DownloaderGUI:
             width=PROGRESS_CARD_WIDTH,
             height=PROGRESS_CARD_HEIGHT,
         )
-        progress_card.grid(row=1, column=0, sticky="nw", pady=(12, 0))
-        self._freeze_widget_size(progress_card)
+        progress_card.grid(row=1, column=0, sticky="nsew", pady=(12, 0))
 
         self.progress_bar = ttk.Progressbar(
             progress_card,
@@ -1414,13 +1411,12 @@ class Era5DownloaderGUI:
             width=LOG_FRAME_WIDTH,
             height=LOG_FRAME_HEIGHT,
         )
-        frame.pack(fill="both", expand=False)
-        self._freeze_widget_size(frame)
+        frame.pack(fill="both", expand=True)
 
         self.log_box = scrolledtext.ScrolledText(
             frame,
             wrap="word",
-            font=("Consolas", 11),
+            font=("Consolas", 12),
             padx=12,
             pady=12,
             borderwidth=0,
@@ -1441,13 +1437,12 @@ class Era5DownloaderGUI:
             width=INSTRUCTIONS_FRAME_WIDTH,
             height=INSTRUCTIONS_FRAME_HEIGHT,
         )
-        frame.pack(fill="both", expand=False)
-        self._freeze_widget_size(frame)
+        frame.pack(fill="both", expand=True)
 
         box = scrolledtext.ScrolledText(
             frame,
             wrap="word",
-            font=("Consolas", 11),
+            font=("Consolas", 12),
             padx=12,
             pady=12,
             borderwidth=0,
@@ -1463,7 +1458,6 @@ class Era5DownloaderGUI:
     def _build_footer(self) -> None:
         footer = ttk.Frame(self.root, padding=(12, 0, 12, 12), height=FOOTER_HEIGHT)
         footer.pack(fill="x", expand=False)
-        self._freeze_widget_size(footer)
         ttk.Label(
             footer,
             textvariable=self.status_var,
@@ -1494,6 +1488,15 @@ class Era5DownloaderGUI:
         }
 
     def _on_close(self) -> None:
+        if self.worker_thread is not None and self.worker_thread.is_alive():
+            if messagebox is not None:
+                should_close = messagebox.askyesno(
+                    "ERA5",
+                    "A download is still running. Quit anyway?",
+                )
+                if not should_close:
+                    return
+
         try:
             save_defaults(self._collect_defaults())
         except OSError:
