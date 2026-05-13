@@ -1,610 +1,461 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-ERA5 Hourly Data Downloader and Extractor
-=========================================
+r"""
+ERA5 single-point wave and wind downloader.
 
-Production GUI application for downloading and extracting hourly ERA5
-single-level data at a user-defined target coordinate.
+Purpose
+-------
+Download ERA5 single-point time series from the Copernicus Climate Data Store
+(CDS) dataset ``reanalysis-era5-single-levels-timeseries`` and create two CSV
+files in the same directory as this script:
 
-Main capabilities
+    - ``era5_data.csv``: merged raw ERA5 table, normalised to a compact set of
+      columns used by the post-processing stage.
+    - ``output.csv``: final engineering table with wave parameters, wind speed
+      and meteorological wind direction.
+
+The final ``output.csv`` columns are fixed:
+
+    datetime,swh,mwp,mwd,wind,dwi,u10,v10
+
+The intermediate merged ``era5_data.csv`` columns are fixed:
+
+    datetime,swh,mwp,mwd,u10,v10
+
+Data requested from CDS
+-----------------------
+The script performs one CDS request with ``data_format="csv"`` for these ERA5
+single-level variables:
+
+    - significant_height_of_combined_wind_waves_and_swell  -> swh
+    - mean_wave_period                                     -> mwp
+    - mean_wave_direction                                  -> mwd
+    - 10m_u_component_of_wind                              -> u10
+    - 10m_v_component_of_wind                              -> v10
+
+Wind gust is not requested. The processed wind speed is computed from ``u10``
+and ``v10``. The processed wind direction ``dwi`` is computed as a
+meteorological direction in degrees, with North = 0 degrees, clockwise positive,
+and values in the interval [0, 360).
+
+CDS payload handling
+--------------------
+Although the request asks for CSV, CDS may return either a plain CSV file or a
+ZIP archive containing separate CSV or Excel tables. This script reads all
+recognised table members in the payload, maps ERA5 long variable names to short
+column names, merges tables by ``datetime`` and writes a single ``era5_data.csv``.
+No separate wave or wind CSV files are retained.
+
+Execution modes
+---------------
+Run without arguments to open the graphical interface:
+
+    python download_era5_data.py
+
+Run from the command line with explicit coordinates and dates:
+
+    python download_era5_data.py --longitude -9.58166667 --latitude 41.14833299 ^
+        --start-date 1940-01-01 --end-date 2026-05-08
+
+Run the graphical interface explicitly:
+
+    python download_era5_data.py --gui
+
+Python virtual environment and dependencies
+-------------------------------------------
+Create and activate a local Python virtual environment on Windows:
+
+    python -m venv venv
+    venv\Scripts\activate
+
+Upgrade pip and install the runtime dependencies:
+
+    python -m pip install --upgrade pip
+    python -m pip install cdsapi numpy pandas openpyxl pyinstaller
+
+Dependency notes:
+
+    - ``cdsapi`` is required for CDS downloads.
+    - ``numpy`` and ``pandas`` are required for table processing.
+    - ``openpyxl`` is required only when CDS returns Excel table members.
+    - ``pyinstaller`` is required only to build the standalone Windows EXE.
+    - ``tkinter`` is used by the GUI and is normally included with standard
+      Windows Python installations from python.org.
+
+Syntax check
+------------
+Before building the executable, check that the script compiles as Python source:
+
+    python -m py_compile download_era5_data.py
+
+Standalone Windows executable
+-----------------------------
+Build a one-file standalone Windows GUI executable with PyInstaller and the
+provided spec file:
+
+    python -m PyInstaller --clean --noconfirm download_era5_data.spec
+
+The executable will be created in:
+
+    dist\download_era5_data.exe
+
+The spec file must use ``console=False`` in the ``EXE(...)`` block. This builds
+a GUI executable and prevents the background command-prompt window from opening
+before the Tkinter window. The program also redirects missing standard streams
+to ``os.devnull`` so third-party download libraries cannot fail when stdout or
+stderr are unavailable in the GUI executable.
+
+Run the executable by double-clicking it:
+
+    dist\download_era5_data.exe
+
+Configuration and outputs
+-------------------------
+The following files are written next to this script or next to the compiled
+executable, depending on how the program is launched:
+
+    - ``defaults.json``: last coordinates and date range used by the GUI/CLI.
+    - ``download_era5_data.log``: execution log.
+    - ``era5_data.csv``: merged raw table.
+    - ``output.csv``: processed table for downstream use.
+
+Operational notes
 -----------------
-- GUI-first workflow with a clean tabbed interface.
-- Download mode for monthly ERA5 retrievals through the CDS API.
-- Extract-only mode for processing existing local GRIB files.
-- ERA5-grid-aligned spatial request window around the target coordinate.
-- Inverse-distance weighting (IDW) interpolation to the exact target point.
-- Background execution, integrated progress reporting, and detailed logging.
-- Optional CLI arguments for scripted runs and automation.
+- A configured CDS API key is required by ``cdsapi.Client``.
+- Existing output files are checked before the download starts. If a CSV is open
+  in Excel or another program, the script stops early with a practical message.
+- CSV files are written through temporary files and then atomically replaced, so
+  failed writes do not leave partially written final outputs.
+- The script is intentionally dependency-light and does not require xarray,
+  cfgrib, eccodes or pygrib.
 """
 
 from __future__ import annotations
 
 import argparse
-import calendar
-import importlib
+import csv
+import io
+import json
 import logging
-import math
-import multiprocessing
 import os
 import queue
 import sys
 import threading
 import time
-from concurrent.futures import ProcessPoolExecutor, TimeoutError, as_completed
-from dataclasses import dataclass, field
-from datetime import datetime
+import zipfile
+from dataclasses import dataclass
+from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Iterable, Optional
+
+
+# -----------------------------------------------------------------------------
+# Windows GUI executable compatibility
+# -----------------------------------------------------------------------------
+
+_OPEN_STANDARD_STREAMS: list[object] = []
+
+
+def _ensure_standard_streams() -> None:
+    """Provide stdout/stderr/stdin replacements in --windowed PyInstaller builds.
+
+    In a Windows GUI executable built with ``console=False`` / ``--windowed``,
+    ``sys.stdout`` and ``sys.stderr`` may be ``None``. Some third-party
+    packages used during HTTP transfers still expect file-like streams and call
+    methods such as ``write()``, ``flush()`` or ``isatty()``. Assigning these
+    streams to ``os.devnull`` keeps the GUI executable silent while preventing
+    ``'NoneType' object has no attribute 'write'`` errors.
+    """
+
+    for stream_name, mode in (("stdout", "w"), ("stderr", "w"), ("stdin", "r")):
+        if getattr(sys, stream_name, None) is None:
+            stream = open(os.devnull, mode, encoding="utf-8", errors="replace")
+            setattr(sys, stream_name, stream)
+            _OPEN_STANDARD_STREAMS.append(stream)
+
+
+def _application_directory() -> Path:
+    """Return the directory where outputs and settings must be written.
+
+    For normal Python execution this is the script folder. For a PyInstaller
+    one-file executable, ``__file__`` points to a temporary extraction directory
+    such as ``_MEIxxxxx``; therefore the correct persistent location is the
+    directory containing ``sys.executable``.
+    """
+
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
+_ensure_standard_streams()
 
 try:
     import numpy as np
-except Exception:
+except Exception:  # pragma: no cover - reported by validate_runtime_dependencies
     np = None
 
 try:
     import pandas as pd
-except Exception:
+except Exception:  # pragma: no cover - reported by validate_runtime_dependencies
     pd = None
 
 try:
     import cdsapi
-except Exception:
+except Exception:  # pragma: no cover - reported by validate_runtime_dependencies
     cdsapi = None
 
 try:
     import tkinter as tk
-    from tkinter import filedialog, messagebox, scrolledtext, ttk
-except Exception:
+    from tkinter import messagebox, scrolledtext, ttk
+except Exception:  # pragma: no cover - GUI is optional
     tk = None
-    filedialog = None
     messagebox = None
     scrolledtext = None
     ttk = None
 
 
-SCRIPT_DIR = Path(__file__).resolve().parent
-DEFAULT_DATA_DIR = SCRIPT_DIR / "grib"
-DEFAULT_RESULTS_DIR = SCRIPT_DIR / "results"
-DEFAULT_OUTPUT_CSV_NAME = "download_era5_data.csv"
-DEFAULT_LOG_FILE = SCRIPT_DIR / "download_era5_data.log"
-DEFAULT_DEFAULTS_FILE = SCRIPT_DIR / "defaults.txt"
-DEFAULT_GRID_STEP = 0.25
-DEFAULT_REQUEST_DELAY = 60
-DEFAULT_MAX_RETRIES = 3
-DEFAULT_IDW_POWER = 2
-DEFAULT_TIMEOUT_PER_FILE = 180
-DEFAULT_WINDOW_WIDTH = 980
-DEFAULT_WINDOW_HEIGHT = 760
-DEFAULT_WINDOW_MIN_WIDTH = 900
-DEFAULT_WINDOW_MIN_HEIGHT = 680
-DEFAULT_COORD_ENTRY_WIDTH = 20
-DEFAULT_YEAR_ENTRY_WIDTH = 12
-DEFAULT_PATH_ENTRY_WIDTH = 52
-GRIB_EXTENSIONS = (".grib", ".grib2", ".grb", ".grb2")
+# -----------------------------------------------------------------------------
+# Paths and fixed CDS settings
+# -----------------------------------------------------------------------------
 
-VARIABLES = {
-    "swh": {
-        "request_code": "229.140",
-        "aliases": {"swh"},
-        "parameter_numbers": {"229"},
-        "parameter_ids": {"140229"},
-    },
-    "mwd": {
-        "request_code": "230.140",
-        "aliases": {"mwd"},
-        "parameter_numbers": {"230"},
-        "parameter_ids": {"140230"},
-    },
-    "pp1d": {
-        "request_code": "231.140",
-        "aliases": {"pp1d"},
-        "parameter_numbers": {"231"},
-        "parameter_ids": {"140231"},
-    },
-    "wind": {
-        "request_code": "245.140",
-        "aliases": {"wind"},
-        "parameter_numbers": {"245"},
-        "parameter_ids": {"140245"},
-    },
-    "dwi": {
-        "request_code": "249.140",
-        "aliases": {"dwi"},
-        "parameter_numbers": {"249"},
-        "parameter_ids": {"140249"},
-    },
-}
+SCRIPT_DIR = _application_directory()
+DEFAULTS_JSON = SCRIPT_DIR / "defaults.json"
+LOG_FILE = SCRIPT_DIR / "download_era5_data.log"
+RAW_CSV = SCRIPT_DIR / "era5_data.csv"
+OUTPUT_CSV = SCRIPT_DIR / "output.csv"
+TEMP_PAYLOAD = SCRIPT_DIR / "_era5_cds_download_payload.zip"
 
-INSTRUCTIONS_TEXT = """
-ERA5 Downloader / Extractor
-===========================
+DATASET_NAME = "reanalysis-era5-single-levels-timeseries"
+TOTAL_PROGRESS_STEPS = 4
 
-Purpose
--------
-This application downloads and/or extracts hourly ERA5 single-level data for a
-single target coordinate and writes the final merged time series to CSV.
+LONG_SWH = "significant_height_of_combined_wind_waves_and_swell"
+LONG_MWP = "mean_wave_period"
+LONG_MWD = "mean_wave_direction"
+LONG_U10 = "10m_u_component_of_wind"
+LONG_V10 = "10m_v_component_of_wind"
 
-The program is intended for production use and supports both interactive GUI
-operation and command-line execution.
+ERA5_VARIABLES = [LONG_U10, LONG_V10, LONG_MWD, LONG_MWP, LONG_SWH]
+OUTPUT_COLUMNS = ["datetime", "swh", "mwp", "mwd", "wind", "dwi", "u10", "v10"]
+MERGED_COLUMNS = ["datetime", "swh", "mwp", "mwd", "u10", "v10"]
 
-What the application does
--------------------------
-- Retrieves monthly ERA5 GRIB files from the Copernicus Climate Data Store.
-- Processes GRIB files already stored locally when download is not required.
-- Extracts the configured variables from each file.
-- Interpolates the ERA5 values to the exact target location using inverse
-  distance weighting (IDW).
-- Merges all processed timestamps into a single CSV sorted by datetime.
-- Writes detailed progress information to the Log tab and to the log file.
-
-Available modes
----------------
-1) Download and process
-   Use this when you want the application to contact CDS, download monthly
-   GRIB files, and process them in the same run.
-
-   Typical workflow:
-   - validate the requested configuration;
-   - initialize the CDS API client;
-   - download one monthly GRIB file per request;
-   - process each downloaded file immediately;
-   - merge results into the selected CSV output.
-
-2) Extract existing GRIB files only
-   Use this when the GRIB files have already been downloaded and are available
-   in the selected GRIB folder.
-
-   Typical workflow:
-   - scan the selected GRIB folder for supported GRIB file extensions;
-   - open and process the files in parallel;
-   - merge extracted data into a fresh CSV output;
-   - sort the final result by datetime.
-
-Target coordinate entry
------------------------
-The coordinate fields are ordered as:
-- Longitude
-- Latitude
-
-Enter coordinates in decimal degrees.
-Examples:
-- Longitude west of Greenwich is negative, e.g. -9.58166667
-- Latitude north of the Equator is positive, e.g. 41.14833299
-
-Take care to place longitude in the first box and latitude in the second box.
-Reversing them will move the target location to a different place and will lead
-to incorrect results. The application stores the last used form values in
-defaults.txt and restores them automatically the next time it starts.
-
-Time range
-----------
-- Start year and End year are used in Download and process mode.
-- In Extract existing GRIB files only mode, the application processes the GRIB
-  files already present in the selected folder regardless of the year range.
-
-Folders and files
------------------
-GRIB folder
-  Folder where downloaded GRIB files are stored and where Extract mode looks
-  for existing input files.
-
-Results folder
-  Folder where the final CSV file is written.
-
-Output CSV name
-  Name of the merged CSV file produced by the run.
-
-Log file
-  Path of the execution log written by the application.
-
-Variables extracted
--------------------
-The current configuration extracts these ERA5 variables:
-- swh  : Significant height of combined wind waves and swell
-- mwd  : Mean wave direction
-- pp1d : Peak wave period
-- wind : 10 metre wind speed
-- dwi  : 10 metre wind direction
-
-Spatial extraction method
--------------------------
-The request window is aligned to the ERA5 0.25° grid around the target
-coordinate. The application then interpolates the value at the exact target
-point using inverse-distance weighting (IDW).
-
-This approach preserves a clean, stable extraction workflow while avoiding the
-need to treat the target point as if it were located exactly on a model node.
-
-How to use the GUI
-------------------
-1. Select the desired mode.
-2. Enter Longitude first and Latitude second.
-3. Enter the start and end years if Download mode is being used.
-4. Confirm or change the GRIB folder, Results folder, output CSV name, and log
-   file path.
-5. Review the request summary shown in the Run tab.
-6. Click Start.
-7. Monitor execution in the Progress panel and the Log tab.
-8. When the run finishes, open the CSV file from the selected results folder.
-
-Status, progress, and logging
------------------------------
-- The Progress panel shows the current stage of the run.
-- The Log tab records detailed execution messages.
-- The log file stores the same operational information on disk.
-- On success, the application reports the full output CSV path.
-- On failure, the error message is reported in the status bar and log.
-
-Dependencies
-------------
-Required Python packages:
-- numpy
-- pandas
-- xarray
-- cfgrib
-- eccodes
-- cdsapi   (required only for Download and process mode)
-
-Typical installation:
-    pip install numpy pandas xarray cfgrib eccodes cdsapi
-
-CDS API credentials
--------------------
-Download mode requires a valid CDS account and a working CDS API setup.
-The usual setup includes a .cdsapirc file in the user home directory.
-
-Typical content:
-    url: https://cds.climate.copernicus.eu/api/v2
-    key: <YOUR_UID>:<YOUR_API_KEY>
-
-Replace the placeholders with your real CDS credentials.
-
-Command-line usage
-------------------
-The script starts in GUI mode by default.
-
-Examples:
-    python download_era5_data.py
-    python download_era5_data.py --gui
-    python download_era5_data.py --download --longitude -9.58166667 --latitude 41.14833299
-    python download_era5_data.py --extract --data-dir grib --results-dir results
-
-Operational notes
------------------
-- The working directory is set to the folder that contains the script.
-- Missing folders are created automatically when needed.
-- Extract mode rebuilds the output CSV from the GRIB files found in the input
-  folder.
-- Final CSV output is sorted by datetime in ascending order.
-- Some GRIB files may contain heterogeneous internal groups; the extractor is
-  designed to handle that structure.
-
-Troubleshooting
----------------
-If Download mode fails:
-- confirm that cdsapi is installed;
-- confirm that CDS credentials are valid;
-- confirm that network access to CDS is available.
-
-If Extract mode fails:
-- confirm that the GRIB folder contains supported GRIB files;
-- confirm that xarray, cfgrib, and eccodes are installed correctly;
-- inspect the Log tab and log file for the failing file name and error message.
-
-If the GUI does not start:
-- confirm that tkinter is available in the Python installation being used.
-""".strip()
-
-
-def format_target_point(longitude: float, latitude: float) -> str:
-    return f"lon={longitude:.8f}, lat={latitude:.8f}"
-
-
-def format_lon_lat_pair(longitude: float, latitude: float, decimals: int = 5) -> str:
-    return f"({longitude:.{decimals}f}, {latitude:.{decimals}f})"
-
-
-
-HARDCODED_DEFAULTS = {
-    "mode": "download",
+HARDCODED_DEFAULTS: dict[str, str] = {
     "longitude": "-9.58166667",
     "latitude": "41.14833299",
-    "start_year": "1940",
-    "end_year": "2026",
-    "data_dir": str(DEFAULT_DATA_DIR),
-    "results_dir": str(DEFAULT_RESULTS_DIR),
-    "output_csv_name": DEFAULT_OUTPUT_CSV_NAME,
-    "log_file": str(DEFAULT_LOG_FILE),
+    "start_date": "1940-01-01",
+    "end_date": (date.today() - timedelta(days=5)).isoformat(),
 }
 
+RAW_TO_SHORT_CANDIDATES: dict[str, list[str]] = {
+    "datetime": ["datetime", "valid_time", "time", "timestamp", "date"],
+    "swh": [LONG_SWH, "swh"],
+    "mwd": [LONG_MWD, "mwd"],
+    "mwp": [LONG_MWP, "mwp", "pp1d"],
+    "u10": [LONG_U10, "u10"],
+    "v10": [LONG_V10, "v10"],
+}
 
-def _parse_defaults_file(text: str) -> Dict[str, str]:
-    parsed: Dict[str, str] = {}
-    for raw_line in text.splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        key = key.strip()
-        value = value.strip()
-        if key:
-            parsed[key] = value
-    return parsed
+INSTRUCTIONS_TEXT = r"""
+ERA5 single-point downloader
+============================
+
+The program performs one CDS request for wave and wind data. CDS can return a
+plain CSV or a ZIP archive containing separate wave and atmospheric tables. The
+program reads the available tables, merges them by datetime and writes one
+merged era5_data.csv plus one processed output.csv.
+
+Files written in the script or executable directory
+---------------------------------------------------
+- era5_data.csv
+- output.csv
+- download_era5_data.log
+- defaults.json
+
+Processed output format
+-----------------------
+output.csv uses these columns:
+    datetime,swh,mwp,mwd,wind,dwi,u10,v10
+
+era5_data.csv uses these columns:
+    datetime,swh,mwp,mwd,u10,v10
+
+Python virtual environment and dependencies
+-------------------------------------------
+Run these commands in Windows cmd from the folder containing the script:
+
+    python -m venv venv
+    venv\Scripts\activate
+    python -m pip install --upgrade pip
+    python -m pip install cdsapi numpy pandas openpyxl pyinstaller
+
+Syntax check
+------------
+
+    python -m py_compile download_era5_data.py
+
+Build one-file standalone Windows GUI EXE
+-----------------------------------------
+
+Compile with the provided spec file:
+
+    python -m PyInstaller --clean --noconfirm download_era5_data.spec
+
+The executable is created as:
+
+    dist\download_era5_data.exe
+
+The spec file must contain console=False in the EXE(...) block. This prevents
+the background command-prompt window from appearing before the Tkinter GUI.
+
+Usage notes
+-----------
+- Longitude and latitude must be entered in decimal degrees.
+- Dates must use YYYY-MM-DD.
+- Outputs are always written to the directory containing the script or EXE.
+- Close existing CSV outputs before running the program again.
+- A configured CDS API key is required by cdsapi.Client.
+""".strip()
+
+DEFAULT_WINDOW_WIDTH = 920
+DEFAULT_WINDOW_HEIGHT = 560
+DEFAULT_WINDOW_MIN_WIDTH = DEFAULT_WINDOW_WIDTH
+DEFAULT_WINDOW_MIN_HEIGHT = DEFAULT_WINDOW_HEIGHT
+
+HEADER_HEIGHT = 84
+BODY_FRAME_WIDTH = 896
+BODY_FRAME_HEIGHT = 386
+FOOTER_HEIGHT = 54
+
+RUN_LEFT_WIDTH = 536
+RUN_RIGHT_WIDTH = 318
+RUN_PANEL_HEIGHT = 300
+POINT_CARD_WIDTH = RUN_LEFT_WIDTH
+POINT_CARD_HEIGHT = 190
+ACTION_CARD_WIDTH = RUN_RIGHT_WIDTH
+ACTION_CARD_HEIGHT = 150
+PROGRESS_CARD_WIDTH = RUN_RIGHT_WIDTH
+PROGRESS_CARD_HEIGHT = 150
+
+LOG_FRAME_WIDTH = BODY_FRAME_WIDTH - 56
+LOG_FRAME_HEIGHT = BODY_FRAME_HEIGHT - 78
+LOG_BOX_WIDTH_CHARS = 104
+LOG_BOX_HEIGHT_LINES = 17
+INSTRUCTIONS_FRAME_WIDTH = BODY_FRAME_WIDTH - 56
+INSTRUCTIONS_FRAME_HEIGHT = BODY_FRAME_HEIGHT - 78
+INSTRUCTIONS_BOX_WIDTH_CHARS = 104
+INSTRUCTIONS_BOX_HEIGHT_LINES = 17
+FOOTER_WRAP_LENGTH = 880
 
 
-def load_saved_defaults(file_path: Path = DEFAULT_DEFAULTS_FILE) -> Dict[str, str]:
+# -----------------------------------------------------------------------------
+# Data model and defaults
+# -----------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class Era5Config:
+    """Runtime configuration for one ERA5 extraction."""
+
+    longitude: float
+    latitude: float
+    start_date: str
+    end_date: str
+
+    @property
+    def raw_csv_path(self) -> Path:
+        return RAW_CSV
+
+    @property
+    def output_csv_path(self) -> Path:
+        return OUTPUT_CSV
+
+    @property
+    def log_file(self) -> Path:
+        return LOG_FILE
+
+
+def _safe_float(value: object, fallback: float) -> float:
+    try:
+        return float(str(value).strip())
+    except (TypeError, ValueError):
+        return fallback
+
+
+def load_defaults() -> dict[str, str]:
+    """Load persisted GUI/CLI defaults and merge them with hardcoded defaults."""
+
     defaults = dict(HARDCODED_DEFAULTS)
     try:
-        if not file_path.exists():
-            return defaults
-        parsed = _parse_defaults_file(file_path.read_text(encoding="utf-8"))
-        for key in defaults:
-            if key in parsed and parsed[key]:
-                defaults[key] = parsed[key]
-        return defaults
-    except Exception:
-        return defaults
+        if DEFAULTS_JSON.exists():
+            loaded = json.loads(DEFAULTS_JSON.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                for key in defaults:
+                    value = loaded.get(key)
+                    if value is not None and str(value).strip():
+                        defaults[key] = str(value).strip()
+    except (OSError, json.JSONDecodeError):
+        pass
+    return defaults
 
 
-def save_defaults(values: Dict[str, str], file_path: Path = DEFAULT_DEFAULTS_FILE) -> None:
+def save_defaults(values: dict[str, str]) -> None:
+    """Persist GUI/CLI defaults used for the next run."""
+
     merged = dict(HARDCODED_DEFAULTS)
     for key in merged:
         if key in values and values[key] is not None:
             merged[key] = str(values[key]).strip()
-    file_path.parent.mkdir(parents=True, exist_ok=True)
-    ordered_keys = [
-        "mode",
-        "longitude",
-        "latitude",
-        "start_year",
-        "end_year",
-        "data_dir",
-        "results_dir",
-        "output_csv_name",
-        "log_file",
-    ]
-    lines = [f"{key}={merged[key]}" for key in ordered_keys]
-    file_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-
-
-def _safe_float(value: str, fallback: float) -> float:
-    try:
-        return float(str(value).strip())
-    except Exception:
-        return fallback
-
-
-def _safe_int(value: str, fallback: int) -> int:
-    try:
-        return int(str(value).strip())
-    except Exception:
-        return fallback
-
-
-SAVED_DEFAULTS = load_saved_defaults()
-INITIAL_MODE = SAVED_DEFAULTS["mode"] if SAVED_DEFAULTS.get("mode") in {"download", "extract"} else HARDCODED_DEFAULTS["mode"]
-INITIAL_LONGITUDE = _safe_float(SAVED_DEFAULTS.get("longitude", HARDCODED_DEFAULTS["longitude"]), float(HARDCODED_DEFAULTS["longitude"]))
-INITIAL_LATITUDE = _safe_float(SAVED_DEFAULTS.get("latitude", HARDCODED_DEFAULTS["latitude"]), float(HARDCODED_DEFAULTS["latitude"]))
-INITIAL_START_YEAR = _safe_int(SAVED_DEFAULTS.get("start_year", HARDCODED_DEFAULTS["start_year"]), int(HARDCODED_DEFAULTS["start_year"]))
-INITIAL_END_YEAR = _safe_int(SAVED_DEFAULTS.get("end_year", HARDCODED_DEFAULTS["end_year"]), int(HARDCODED_DEFAULTS["end_year"]))
-INITIAL_DATA_DIR = SAVED_DEFAULTS.get("data_dir", HARDCODED_DEFAULTS["data_dir"]) or HARDCODED_DEFAULTS["data_dir"]
-INITIAL_RESULTS_DIR = SAVED_DEFAULTS.get("results_dir", HARDCODED_DEFAULTS["results_dir"]) or HARDCODED_DEFAULTS["results_dir"]
-INITIAL_OUTPUT_CSV_NAME = SAVED_DEFAULTS.get("output_csv_name", HARDCODED_DEFAULTS["output_csv_name"]) or HARDCODED_DEFAULTS["output_csv_name"]
-INITIAL_LOG_FILE = SAVED_DEFAULTS.get("log_file", HARDCODED_DEFAULTS["log_file"]) or HARDCODED_DEFAULTS["log_file"]
-
-
-@dataclass
-class Era5Config:
-    longitude: float = INITIAL_LONGITUDE
-    latitude: float = INITIAL_LATITUDE
-    start_year: int = INITIAL_START_YEAR
-    end_year: int = INITIAL_END_YEAR
-    data_dir: Path = field(default_factory=lambda: Path(INITIAL_DATA_DIR).expanduser())
-    results_dir: Path = field(default_factory=lambda: Path(INITIAL_RESULTS_DIR).expanduser())
-    output_csv_name: str = INITIAL_OUTPUT_CSV_NAME
-    log_file: Path = field(default_factory=lambda: Path(INITIAL_LOG_FILE).expanduser())
-    grid_step: float = DEFAULT_GRID_STEP
-    request_delay: int = DEFAULT_REQUEST_DELAY
-    max_retries: int = DEFAULT_MAX_RETRIES
-    idw_power: int = DEFAULT_IDW_POWER
-    timeout_per_file: int = DEFAULT_TIMEOUT_PER_FILE
-
-    @property
-    def years(self) -> List[int]:
-        return list(range(self.start_year, self.end_year + 1))
-
-    @property
-    def output_csv(self) -> Path:
-        return self.results_dir / self.output_csv_name
-
-    @property
-    def area(self) -> List[float]:
-        north, west, south, east = compute_surrounding_four_point_area(
-            target_lat=self.latitude,
-            target_lon=self.longitude,
-            grid_step=self.grid_step,
-        )
-        return [north, west, south, east]
-
-    @property
-    def grid(self) -> List[float]:
-        return [self.grid_step, self.grid_step]
-
-    @property
-    def surrounding_points(self) -> List[Tuple[float, float]]:
-        north, west, south, east = self.area
-        return [
-            (north, west),
-            (north, east),
-            (south, west),
-            (south, east),
-        ]
-
-
-def compute_surrounding_four_point_area(target_lat: float, target_lon: float, grid_step: float = 0.25) -> Tuple[float, float, float, float]:
-    """
-    Return an ERA5 request window that encloses the target with exactly 2x2 grid
-    nodes for a regular grid of size `grid_step`.
-
-    The returned tuple is (north, west, south, east).
-    """
-    if grid_step <= 0:
-        raise ValueError("grid_step must be > 0")
-
-    lat_scaled = target_lat / grid_step
-    lon_scaled = target_lon / grid_step
-
-    south = math.floor(lat_scaled) * grid_step
-    north = math.ceil(lat_scaled) * grid_step
-    west = math.floor(lon_scaled) * grid_step
-    east = math.ceil(lon_scaled) * grid_step
-
-    # If the target lies exactly on a grid line, widen by one grid cell so the
-    # request still contains two nodes in that direction.
-    if math.isclose(north, south, rel_tol=0.0, abs_tol=1e-12):
-        north = south + grid_step
-    if math.isclose(east, west, rel_tol=0.0, abs_tol=1e-12):
-        east = west + grid_step
-
-    return (
-        round(north, 10),
-        round(west, 10),
-        round(south, 10),
-        round(east, 10),
+    DEFAULTS_JSON.write_text(
+        json.dumps(merged, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
     )
 
 
+SAVED_DEFAULTS = load_defaults()
+INITIAL_LONGITUDE = _safe_float(
+    SAVED_DEFAULTS["longitude"],
+    float(HARDCODED_DEFAULTS["longitude"]),
+)
+INITIAL_LATITUDE = _safe_float(
+    SAVED_DEFAULTS["latitude"],
+    float(HARDCODED_DEFAULTS["latitude"]),
+)
+INITIAL_START_DATE = SAVED_DEFAULTS["start_date"]
+INITIAL_END_DATE = SAVED_DEFAULTS["end_date"]
+
+
+# -----------------------------------------------------------------------------
+# Logging and progress reporting
+# -----------------------------------------------------------------------------
+
+ProgressCallback = Callable[[str, dict[str, object]], None]
+
+
 def setup_logging(log_file: Path) -> None:
-    """Configure file logging for the current process."""
+    """Create a fresh file logger for the current run."""
+
     log_file.parent.mkdir(parents=True, exist_ok=True)
     root_logger = logging.getLogger()
     root_logger.setLevel(logging.INFO)
 
-    existing_targets = {
-        getattr(handler, "baseFilename", None) for handler in root_logger.handlers
-    }
-    if str(log_file) not in existing_targets:
-        file_handler = logging.FileHandler(log_file, encoding="utf-8")
-        file_handler.setLevel(logging.INFO)
-        file_handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
-        root_logger.addHandler(file_handler)
+    for handler in list(root_logger.handlers):
+        root_logger.removeHandler(handler)
+        try:
+            handler.close()
+        except Exception:
+            pass
 
+    handler = logging.FileHandler(log_file, encoding="utf-8")
+    handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
+    root_logger.addHandler(handler)
 
-def _dependency_check_line(module_name: str, install_name: Optional[str], purpose: str) -> Optional[str]:
-    try:
-        importlib.import_module(module_name)
-        return None
-    except Exception as exc:
-        install_hint = f" Install with: pip install {install_name or module_name}."
-        return f"Missing required dependency '{module_name}' for {purpose}. Import error: {exc}.{install_hint}"
-
-
-def validate_runtime_dependencies(mode: str, wants_gui: bool, reporter: Optional["ProgressReporter"] = None) -> None:
-    missing_messages: List[str] = []
-
-    if np is None:
-        missing_messages.append(
-            "Missing required dependency 'numpy' for numerical operations and interpolation. "
-            "Install with: pip install numpy."
-        )
-    if pd is None:
-        missing_messages.append(
-            "Missing required dependency 'pandas' for datetime handling and CSV output. "
-            "Install with: pip install pandas."
-        )
-
-    for module_name, install_name, purpose in [
-        ("xarray", "xarray", "GRIB dataset handling"),
-        ("cfgrib", "cfgrib", "GRIB file reading"),
-        ("eccodes", "eccodes", "GRIB decoding backend used by cfgrib"),
-    ]:
-        message = _dependency_check_line(module_name, install_name, purpose)
-        if message is not None:
-            missing_messages.append(message)
-
-    if mode == "download" and cdsapi is None:
-        missing_messages.append(
-            "Missing required dependency 'cdsapi' for CDS downloads. Install with: pip install cdsapi."
-        )
-
-    if wants_gui and tk is None:
-        missing_messages.append(
-            "Missing required dependency 'tkinter' for GUI mode. Install/enable tkinter in this Python distribution."
-        )
-
-    if missing_messages:
-        header = "Runtime dependency check failed:"
-        logging.error(header)
-        if reporter is not None:
-            reporter.log(header)
-        for message in missing_messages:
-            logging.error(message)
-            if reporter is not None:
-                reporter.log(message)
-        raise RuntimeError("One or more required dependencies are not installed. See log file for details.")
-
-
-@dataclass
-class GribProcessResult:
-    file_path: str
-    dataframe: Optional[pd.DataFrame] = None
-    open_ok: bool = False
-    dataset_count: int = 0
-    dataset_without_variables_count: int = 0
-    inspected_variable_count: int = 0
-    recognized_variable_count: int = 0
-    skipped_variable_count: int = 0
-    variable_error_count: int = 0
-    extracted_timestamp_count: int = 0
-    open_error: Optional[str] = None
-
-    @property
-    def file_name(self) -> str:
-        return Path(self.file_path).name
-
-    @property
-    def has_data(self) -> bool:
-        return self.dataframe is not None and not self.dataframe.empty and self.extracted_timestamp_count > 0
-
-    def summary_message(self, include_download_context: bool = False) -> str:
-        prefix = "Download/lookup completed. " if include_download_context else ""
-        if not self.open_ok:
-            detail = self.open_error or "cfgrib could not open the file."
-            return f"{prefix}Extraction failed for {self.file_name}: unable to open GRIB with cfgrib ({detail})."
-
-        if self.has_data:
-            return (
-                f"{prefix}Extraction succeeded for {self.file_name}: "
-                f"{self.extracted_timestamp_count} timestamps written "
-                f"from {self.recognized_variable_count} recognized variable occurrence(s)."
-            )
-
-        reasons = []
-        if self.recognized_variable_count == 0:
-            reasons.append("no GRIB variable matched the configured ERA5 variable map")
-        if self.variable_error_count > 0:
-            reasons.append(f"{self.variable_error_count} recognized variable(s) failed during interpolation/extraction")
-        if self.dataset_without_variables_count > 0:
-            reasons.append(f"{self.dataset_without_variables_count} dataset group(s) contained no data variables")
-        if not reasons:
-            reasons.append("the file opened but produced no usable rows")
-
-        return (
-            f"{prefix}Extraction produced no usable rows for {self.file_name}: "
-            + "; ".join(reasons)
-            + "."
-        )
-
-
-def _report_process_result(result: GribProcessResult, reporter: ProgressReporter, include_download_context: bool = False) -> None:
-    reporter.log(result.summary_message(include_download_context=include_download_context))
 
 class ProgressReporter:
-    def __init__(self, callback: Optional[Callable[[str, Dict], None]] = None):
+    """Small adapter used by CLI and GUI to receive pipeline messages."""
+
+    def __init__(self, callback: Optional[ProgressCallback] = None) -> None:
         self.callback = callback
 
-    def emit(self, event: str, **payload: Dict) -> None:
+    def emit(self, event: str, **payload: object) -> None:
         if self.callback is not None:
             self.callback(event, payload)
 
@@ -615,570 +466,743 @@ class ProgressReporter:
     def status(self, message: str) -> None:
         self.emit("status", message=message)
 
-    def progress(self, current: int, total: int, message: str = "") -> None:
+    def progress(self, current: int, total: int, message: str) -> None:
         self.emit("progress", current=current, total=total, message=message)
+
+
+# -----------------------------------------------------------------------------
+# Dependency and CDS client setup
+# -----------------------------------------------------------------------------
+
+def validate_runtime_dependencies(wants_gui: bool) -> None:
+    """Fail early with a direct dependency message."""
+
+    missing: list[str] = []
+    if np is None:
+        missing.append("numpy")
+    if pd is None:
+        missing.append("pandas")
+    if cdsapi is None:
+        missing.append("cdsapi")
+    if wants_gui and tk is None:
+        missing.append("tkinter")
+
+    if missing:
+        raise RuntimeError(
+            "Missing required dependencies: "
+            + ", ".join(missing)
+            + ". Install them and run the script again."
+        )
 
 
 def initialize_cds_client() -> "cdsapi.Client":
     if cdsapi is None:
-        raise RuntimeError("cdsapi is not installed. Install it to use download mode.")
+        raise RuntimeError("cdsapi is not installed.")
     return cdsapi.Client()
 
 
-def download_monthly_data(
-    client: "cdsapi.Client",
-    year: int,
-    month: int,
-    variable_list: List[str],
-    area: List[float],
-    grid: List[float],
-    output_dir: Path,
-    request_delay: int,
-    max_retries: int,
-    reporter: Optional[ProgressReporter] = None,
-) -> Optional[Path]:
-    file_name = f"ERA5_{year}_{month:02d}.grib"
-    file_path = output_dir / file_name
+# -----------------------------------------------------------------------------
+# CSV and payload parsing utilities
+# -----------------------------------------------------------------------------
 
-    if file_path.exists():
-        if reporter:
-            reporter.log(f"Monthly GRIB already exists for {year}-{month:02d}. Reusing local file {file_name}.")
-        return file_path
+def normalize_name(value: object) -> str:
+    """Return a stable lower-case token for matching ERA5 column names."""
 
-    days_in_month = calendar.monthrange(year, month)[1]
-    days = [f"{day:02d}" for day in range(1, days_in_month + 1)]
+    text = str(value).strip().lower()
+    for char in (" ", "-", "/", "(", ")", "[", "]", ".", '"', "'"):
+        text = text.replace(char, "_")
+    while "__" in text:
+        text = text.replace("__", "_")
+    return text.strip("_")
 
-    for attempt in range(1, max_retries + 1):
+
+def _decode_bytes_with_fallbacks(data: bytes, source_name: str) -> str:
+    last_error: Optional[Exception] = None
+    for encoding in ("utf-8-sig", "utf-8", "cp1252", "latin1"):
         try:
-            if reporter:
-                reporter.log(
-                    f"Downloading {year}-{month:02d} (attempt {attempt}/{max_retries}) using an ERA5-aligned request window."
-                )
-            client.retrieve(
-                "reanalysis-era5-single-levels",
-                {
-                    "product_type": "reanalysis",
-                    "format": "grib",
-                    "variable": variable_list,
-                    "year": str(year),
-                    "month": f"{month:02d}",
-                    "day": days,
-                    "time": [f"{hour:02d}:00" for hour in range(24)],
-                    "area": area,
-                    "grid": grid,
-                },
-                str(file_path),
-            )
-            if reporter:
-                reporter.log(f"Download completed for {year}-{month:02d}: {file_name}")
-            return file_path
-        except Exception as exc:
-            logging.warning("Attempt %d failed for %s-%02d. Error: %s", attempt, year, month, exc)
-            if reporter:
-                reporter.log(f"Download attempt {attempt} failed for {year}-{month:02d}: {exc}")
-            if attempt < max_retries:
-                wait_time = request_delay * attempt
-                if reporter:
-                    reporter.log(f"Waiting {wait_time} s before retrying {year}-{month:02d}.")
-                time.sleep(wait_time)
-            else:
-                if reporter:
-                    reporter.log(f"Download failed for {year}-{month:02d} after {max_retries} attempt(s).")
-                return None
-    return None
+            return data.decode(encoding)
+        except UnicodeDecodeError as exc:
+            last_error = exc
+    raise RuntimeError(f"Could not decode text payload '{source_name}': {last_error}")
 
 
-def _choose_coord_name(obj, *names: str) -> Optional[str]:
-    for name in names:
-        if name in getattr(obj, "coords", {}):
-            return name
-    for name in names:
-        if name in getattr(obj, "dims", {}):
-            return name
-    return None
+def _detect_delimiter_from_header(header_line: str) -> str:
+    return max((",", ";", "\t"), key=header_line.count)
 
 
-def _normalize_target_longitude(dataset_or_array, target_lon: float) -> float:
-    lon_name = _choose_coord_name(dataset_or_array, "longitude", "lon")
-    if lon_name is None:
-        return target_lon
+def _parse_header_line(line: str, delimiter: str) -> list[str]:
+    """Parse one header line while tolerating malformed metadata text."""
 
     try:
-        lon_values = np.asarray(dataset_or_array[lon_name].values, dtype=float)
+        tokens = next(csv.reader([line], delimiter=delimiter))
+    except csv.Error:
+        tokens = line.split(delimiter)
+    return [str(token).strip().strip('"').strip("'") for token in tokens]
+
+
+def _looks_like_table_header(line: str) -> bool:
+    stripped = line.strip()
+    if not stripped or stripped.startswith("#"):
+        return False
+
+    delimiter = _detect_delimiter_from_header(stripped)
+    tokens = [normalize_name(token) for token in _parse_header_line(stripped, delimiter)]
+    token_set = set(tokens)
+    datetime_markers = {normalize_name(item) for item in RAW_TO_SHORT_CANDIDATES["datetime"]}
+    variable_markers = {
+        normalize_name(LONG_SWH),
+        normalize_name(LONG_MWD),
+        normalize_name(LONG_MWP),
+        normalize_name(LONG_U10),
+        normalize_name(LONG_V10),
+        "swh",
+        "mwd",
+        "mwp",
+        "u10",
+        "v10",
+    }
+    return bool(token_set & datetime_markers) and bool(token_set & variable_markers)
+
+
+def _detect_header_index(lines: list[str]) -> int:
+    """Find the first row that appears to be a CDS table header."""
+
+    for index, line in enumerate(lines):
+        if _looks_like_table_header(line):
+            return index
+    return 0
+
+
+def _read_csv_text_robust(text: str, source_name: str) -> "pd.DataFrame":
+    """Read a CDS CSV table, ignoring metadata lines before the real header."""
+
+    lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    header_index = _detect_header_index(lines)
+    useful_lines = lines[header_index:]
+
+    while useful_lines and not useful_lines[-1].strip():
+        useful_lines.pop()
+
+    if not useful_lines:
+        raise RuntimeError(f"CSV '{source_name}' is empty.")
+
+    header_line = useful_lines[0].strip()
+    delimiter = _detect_delimiter_from_header(header_line)
+    header_tokens = _parse_header_line(header_line, delimiter)
+    expected_fields = len(header_tokens)
+
+    if expected_fields < 2:
+        raise RuntimeError(f"CSV '{source_name}' does not contain a valid table header.")
+
+    filtered_lines = [delimiter.join(header_tokens)]
+    for raw_line in useful_lines[1:]:
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.count(delimiter) == expected_fields - 1:
+            filtered_lines.append(line)
+
+    if len(filtered_lines) <= 1:
+        raise RuntimeError(f"CSV '{source_name}' contains a header but no usable data rows.")
+
+    cleaned_text = "\n".join(filtered_lines)
+    try:
+        dataframe = pd.read_csv(io.StringIO(cleaned_text), sep=delimiter, engine="python")
     except Exception:
-        return target_lon
-
-    if lon_values.size == 0:
-        return target_lon
-
-    lon_min = np.nanmin(lon_values)
-    lon_max = np.nanmax(lon_values)
-
-    if lon_min >= 0.0 and lon_max > 180.0 and target_lon < 0.0:
-        return target_lon % 360.0
-    if lon_max <= 180.0 and target_lon > 180.0:
-        return ((target_lon + 180.0) % 360.0) - 180.0
-    return target_lon
-
-
-def _identify_variable_key(data_var_name: str, data_array) -> Optional[str]:
-    attrs = getattr(data_array, "attrs", {}) or {}
-    candidate_strings = set()
-
-    def _add(value: object) -> None:
-        if value is None:
-            return
-        text = str(value).strip().lower()
-        if text:
-            candidate_strings.add(text)
-
-    _add(data_var_name)
-    for attr_name in (
-        "GRIB_shortName", "shortName",
-        "GRIB_cfVarName", "cfVarName",
-        "GRIB_name", "long_name", "standard_name",
-        "GRIB_parameterNumber", "parameterNumber",
-        "GRIB_paramId", "paramId",
-    ):
-        _add(attrs.get(attr_name))
-
-    param_number = attrs.get("GRIB_parameterNumber", attrs.get("parameterNumber"))
-    if param_number is not None:
-        try:
-            param_number_int = int(param_number)
-            candidate_strings.add(str(param_number_int))
-            candidate_strings.add(f"{param_number_int}.140")
-        except Exception:
-            pass
-
-    param_id = attrs.get("GRIB_paramId", attrs.get("paramId"))
-    if param_id is not None:
-        try:
-            candidate_strings.add(str(int(param_id)))
-        except Exception:
-            candidate_strings.add(str(param_id).strip().lower())
-
-    for output_key, spec in VARIABLES.items():
-        accepted = set(spec["aliases"])
-        accepted.add(spec["request_code"])
-        accepted.update(spec["parameter_numbers"])
-        accepted.update(spec["parameter_ids"])
-        if candidate_strings & {item.lower() for item in accepted}:
-            return output_key
-
-    return None
-
-
-def _reduce_dataarray_to_time_lat_lon(data_array):
-    keep_dim_names = {"time", "valid_time", "latitude", "longitude", "lat", "lon", "y", "x"}
-    da = data_array.squeeze(drop=True)
-
-    extra_non_singleton_dims = [
-        dim for dim in da.dims
-        if dim not in keep_dim_names and da.sizes.get(dim, 1) > 1
-    ]
-    for dim in extra_non_singleton_dims:
-        logging.info(
-            "Unexpected non-singleton dimension '%s' in variable '%s'. Selecting first element.",
-            dim,
-            getattr(da, "name", "unknown"),
+        dataframe = pd.read_csv(
+            io.StringIO(cleaned_text),
+            sep=delimiter,
+            engine="python",
+            quoting=csv.QUOTE_NONE,
+            on_bad_lines="skip",
         )
-        da = da.isel({dim: 0})
 
-    return da.squeeze(drop=True)
-
-
-def _extract_time_values(data_array, dataset=None) -> List[pd.Timestamp]:
-    if "valid_time" in data_array.coords:
-        values = np.atleast_1d(data_array["valid_time"].values)
-        return pd.to_datetime(values, errors="coerce", format="mixed").tolist()
-    if "time" in data_array.coords:
-        values = np.atleast_1d(data_array["time"].values)
-        return pd.to_datetime(values, errors="coerce", format="mixed").tolist()
-
-    if dataset is not None:
-        if "valid_time" in dataset.coords:
-            values = np.atleast_1d(dataset["valid_time"].values)
-            return pd.to_datetime(values, errors="coerce", format="mixed").tolist()
-        if "time" in dataset.coords:
-            values = np.atleast_1d(dataset["time"].values)
-            return pd.to_datetime(values, errors="coerce", format="mixed").tolist()
-
-    return [pd.NaT]
+    dataframe.columns = [str(column).strip().strip('"').strip("'") for column in dataframe.columns]
+    if len(dataframe.columns) < 2:
+        raise RuntimeError(f"CSV '{source_name}' does not contain a valid table.")
+    return dataframe
 
 
-def _build_lat_lon_grids(data_array):
-    lat_name = _choose_coord_name(data_array, "latitude", "lat")
-    lon_name = _choose_coord_name(data_array, "longitude", "lon")
-    if lat_name is None or lon_name is None:
-        raise ValueError("Latitude/longitude coordinates were not found in the GRIB dataset.")
+def _is_probably_text_csv(data: bytes) -> bool:
+    """Reject common binary containers before trying to parse as text CSV."""
 
-    lat_values = np.asarray(data_array[lat_name].values, dtype=float)
-    lon_values = np.asarray(data_array[lon_name].values, dtype=float)
-
-    if lat_values.ndim == 1 and lon_values.ndim == 1:
-        lat_grid, lon_grid = np.meshgrid(lat_values, lon_values, indexing="ij")
-    else:
-        lat_grid, lon_grid = lat_values, lon_values
-
-    return lat_grid, lon_grid, lat_name, lon_name
+    if not data:
+        return False
+    if data[:2] in {b"PK", b"\x1f\x8b"}:
+        return False
+    if data[:3] == b"CDF" or data[:8] == b"\x89HDF\r\n\x1a\n":
+        return False
+    if b"\x00" in data[:4096]:
+        return False
+    return True
 
 
-def _idw_interpolate_dataarray(data_array, target_lat: float, target_lon: float, power: int = 2) -> np.ndarray:
-    da = _reduce_dataarray_to_time_lat_lon(data_array)
-    lat_grid, lon_grid, lat_name, lon_name = _build_lat_lon_grids(da)
-
-    normalized_lon = _normalize_target_longitude(da, target_lon)
-    dist = np.sqrt((lat_grid - target_lat) ** 2 + (lon_grid - normalized_lon) ** 2)
-    dist_flat = dist.reshape(-1)
-
-    time_dim = None
-    for candidate in ("valid_time", "time"):
-        if candidate in da.dims:
-            time_dim = candidate
-            break
-
-    if time_dim is not None:
-        ordered_dims = [time_dim] + [dim for dim in da.dims if dim != time_dim]
-        da = da.transpose(*ordered_dims)
-        data = np.asarray(da.values, dtype=float)
-        data_2d = data.reshape(data.shape[0], -1)
-    else:
-        data = np.asarray(da.values, dtype=float)
-        data_2d = data.reshape(1, -1)
-
-    exact_idx = np.where(dist_flat < 1e-12)[0]
-    if exact_idx.size > 0:
-        return np.asarray(data_2d[:, exact_idx[0]], dtype=float)
-
-    weights = 1.0 / np.power(dist_flat, power)
-    finite_mask = np.isfinite(data_2d)
-    weighted_data = np.where(finite_mask, data_2d * weights, 0.0)
-    effective_weights = np.where(finite_mask, weights, 0.0)
-    numerator = weighted_data.sum(axis=1)
-    denominator = effective_weights.sum(axis=1)
-
-    with np.errstate(invalid="ignore", divide="ignore"):
-        values = numerator / denominator
-
-    return np.asarray(values, dtype=float)
+def read_csv_robust(csv_path: Path) -> "pd.DataFrame":
+    data = csv_path.read_bytes()
+    if not _is_probably_text_csv(data):
+        raise RuntimeError(f"CSV '{csv_path.name}' is not a plain text CSV file.")
+    text = _decode_bytes_with_fallbacks(data, csv_path.name)
+    return _read_csv_text_robust(text, csv_path.name)
 
 
-def _safe_open_cfgrib_datasets(file_path: Path):
+def _read_excel_member(data: bytes, member_name: str) -> list["pd.DataFrame"]:
     try:
-        import cfgrib
+        sheets = pd.read_excel(io.BytesIO(data), sheet_name=None)
     except Exception as exc:
-        raise ImportError(
-            "cfgrib is not installed or could not be imported. Install cfgrib and eccodes to extract GRIB data."
-        ) from exc
+        raise RuntimeError(f"Could not read Excel member '{member_name}': {exc}") from exc
 
-    return cfgrib.open_datasets(
-        str(file_path),
-        backend_kwargs={
-            "indexpath": "",
-            "cache_geo_coords": True,
-            "read_keys": ["shortName", "cfVarName", "paramId", "parameterNumber"],
-        },
+    frames: list[pd.DataFrame] = []
+    for dataframe in sheets.values():
+        if isinstance(dataframe, pd.DataFrame) and not dataframe.empty:
+            frame = dataframe.copy()
+            frame.columns = [str(column).strip() for column in frame.columns]
+            frames.append(frame)
+
+    if not frames:
+        raise RuntimeError(f"Excel member '{member_name}' contains no usable sheets.")
+    return frames
+
+
+def _read_payload_member_tables(member_name: str, data: bytes) -> list["pd.DataFrame"]:
+    suffix = Path(member_name).suffix.lower()
+
+    if suffix == ".csv" or (not suffix and _is_probably_text_csv(data)):
+        text = _decode_bytes_with_fallbacks(data, member_name)
+        return [_read_csv_text_robust(text, member_name)]
+
+    if suffix in {".xlsx", ".xls"}:
+        return _read_excel_member(data, member_name)
+
+    raise RuntimeError(f"Unsupported table member '{member_name}'.")
+
+
+def _read_tables_from_cds_payload(payload_path: Path, reporter: ProgressReporter) -> list["pd.DataFrame"]:
+    data = payload_path.read_bytes()
+
+    if zipfile.is_zipfile(payload_path):
+        return _read_tables_from_zip_payload(payload_path, reporter)
+
+    if _is_probably_text_csv(data):
+        reporter.log("Plain CSV payload detected.")
+        text = _decode_bytes_with_fallbacks(data, payload_path.name)
+        return [_read_csv_text_robust(text, payload_path.name)]
+
+    if data[:2] == b"PK":
+        reporter.log("Office Open XML payload detected; attempting Excel read.")
+        return _read_excel_member(data, payload_path.name)
+
+    raise RuntimeError(
+        "CDS returned a payload that is neither a ZIP archive nor a plain CSV/Excel table."
     )
 
 
-def process_grib_file_df(file_path: str, latitude: float, longitude: float, idw_power: int, log_file: str) -> GribProcessResult:
-    path_obj = Path(file_path)
-    setup_logging(Path(log_file))
-    result = GribProcessResult(file_path=str(path_obj))
+def _read_tables_from_zip_payload(payload_path: Path, reporter: ProgressReporter) -> list["pd.DataFrame"]:
+    frames: list[pd.DataFrame] = []
+
+    with zipfile.ZipFile(payload_path, "r") as archive:
+        member_names = [
+            name
+            for name in archive.namelist()
+            if not name.endswith("/") and Path(name).suffix.lower() in {".csv", ".xlsx", ".xls"}
+        ]
+
+        if not member_names:
+            raise RuntimeError("The CDS ZIP payload does not contain any CSV/XLSX/XLS table members.")
+
+        reporter.log("ZIP payload detected. Table members: " + ", ".join(member_names))
+        for name in member_names:
+            member_frames = _read_payload_member_tables(name, archive.read(name))
+            for index, frame in enumerate(member_frames, start=1):
+                sheet_text = f" sheet {index}" if len(member_frames) > 1 else ""
+                reporter.log(
+                    f"Read member '{name}'{sheet_text}: "
+                    f"{len(frame):,} rows; columns: {', '.join(str(c) for c in frame.columns)}"
+                )
+            frames.extend(member_frames)
+
+    return frames
+
+
+# -----------------------------------------------------------------------------
+# Column mapping and data standardisation
+# -----------------------------------------------------------------------------
+
+def _find_datetime_column(dataframe: "pd.DataFrame") -> Optional[str]:
+    datetime_candidates = {normalize_name(item) for item in RAW_TO_SHORT_CANDIDATES["datetime"]}
+    for column in dataframe.columns:
+        if normalize_name(column) in datetime_candidates:
+            return str(column)
+    return None
+
+
+def _find_normalized_column(dataframe: "pd.DataFrame", candidates: Iterable[str]) -> Optional[str]:
+    normalized_to_actual = {normalize_name(column): str(column) for column in dataframe.columns}
+    for candidate in candidates:
+        actual = normalized_to_actual.get(normalize_name(candidate))
+        if actual is not None:
+            return actual
+    return None
+
+
+def _map_wide_columns(dataframe: "pd.DataFrame") -> "pd.DataFrame":
+    working = dataframe.copy()
+    datetime_column = _find_datetime_column(working)
+    if datetime_column is None:
+        raise RuntimeError("Could not identify a datetime column.")
+
+    rename_map = {datetime_column: "datetime"}
+    normalized_to_actual = {normalize_name(column): column for column in working.columns}
+
+    for short_name, candidates in RAW_TO_SHORT_CANDIDATES.items():
+        if short_name == "datetime":
+            continue
+        for candidate in candidates:
+            actual = normalized_to_actual.get(normalize_name(candidate))
+            if actual is not None:
+                rename_map[actual] = short_name
+                break
+
+    working = working.rename(columns=rename_map)
+    keep = [column for column in MERGED_COLUMNS if column in working.columns]
+    if "datetime" not in keep:
+        raise RuntimeError("Wide-format CSV could not be mapped to datetime.")
+    return working[keep].copy()
+
+
+def _map_long_format(dataframe: "pd.DataFrame") -> "pd.DataFrame":
+    datetime_col = _find_normalized_column(dataframe, ["datetime", "valid_time", "time", "timestamp", "date"])
+    variable_col = _find_normalized_column(dataframe, ["variable", "parameter", "var", "name"])
+    value_col = _find_normalized_column(dataframe, ["value", "observation", "data"])
+
+    if datetime_col is None or variable_col is None or value_col is None:
+        raise RuntimeError("CSV is not in a recognised long format.")
+
+    alias_map: dict[str, str] = {}
+    for short_name, names in RAW_TO_SHORT_CANDIDATES.items():
+        if short_name == "datetime":
+            continue
+        for name in names:
+            alias_map[name] = short_name
+            alias_map[normalize_name(name)] = short_name
+
+    working = dataframe[[datetime_col, variable_col, value_col]].copy()
+    working.columns = ["datetime", "variable", "value"]
+    working["variable"] = working["variable"].map(
+        lambda value: alias_map.get(str(value), alias_map.get(normalize_name(value), normalize_name(value)))
+    )
+    working = working[working["variable"].isin(["swh", "mwd", "mwp", "u10", "v10"])]
+
+    wide = working.pivot_table(
+        index="datetime",
+        columns="variable",
+        values="value",
+        aggfunc="first",
+    ).reset_index()
+    wide.columns.name = None
+    return wide
+
+
+def standardize_dataframe(raw_dataframe: "pd.DataFrame") -> "pd.DataFrame":
+    """Map CDS table columns to the internal compact column names."""
 
     try:
-        datasets = _safe_open_cfgrib_datasets(path_obj)
-        result.open_ok = True
-        result.dataset_count = len(datasets)
-    except Exception as exc:
-        result.open_error = str(exc)
-        logging.error("Failed to open %s with cfgrib. Error: %s", path_obj, exc)
-        return result
+        wide = _map_wide_columns(raw_dataframe)
+        if any(column in wide.columns for column in ["swh", "mwd", "mwp", "u10", "v10"]):
+            return wide
+    except Exception:
+        pass
+    return _map_long_format(raw_dataframe)
 
-    data_records: Dict[str, Dict[str, Optional[float]]] = {}
 
-    for dataset_index, ds in enumerate(datasets):
-        try:
-            data_var_names = list(ds.data_vars)
-        except Exception:
-            data_var_names = []
+def _parse_datetime_series(series: "pd.Series") -> "pd.Series":
+    try:
+        parsed = pd.to_datetime(series, errors="coerce", format="mixed")
+    except TypeError:
+        parsed = pd.to_datetime(series, errors="coerce")
 
-        if not data_var_names:
-            result.dataset_without_variables_count += 1
-            logging.info("Dataset #%d in %s contains no data variables.", dataset_index, path_obj.name)
-            try:
-                ds.close()
-            except Exception:
-                pass
+    try:
+        if getattr(parsed.dt, "tz", None) is not None:
+            parsed = parsed.dt.tz_convert(None)
+    except Exception:
+        pass
+    return parsed
+
+
+def _ensure_numeric(dataframe: "pd.DataFrame", columns: Iterable[str]) -> None:
+    for column in columns:
+        if column in dataframe.columns:
+            dataframe[column] = pd.to_numeric(dataframe[column], errors="coerce")
+
+
+def _meteorological_direction_from_uv(u10: "pd.Series", v10: "pd.Series") -> "pd.Series":
+    return (180.0 + np.degrees(np.arctan2(u10, v10))) % 360.0
+
+
+def _coalesce_duplicate_columns(dataframe: "pd.DataFrame") -> "pd.DataFrame":
+    """Collapse duplicate columns by taking the first non-empty value per row."""
+
+    result = pd.DataFrame(index=dataframe.index)
+    for column in dataframe.columns:
+        if column in result.columns:
             continue
 
-        for data_var_name in data_var_names:
-            result.inspected_variable_count += 1
-            try:
-                da = ds[data_var_name]
-                var_key = _identify_variable_key(data_var_name, da)
-                if var_key is None:
-                    result.skipped_variable_count += 1
-                    logging.info(
-                        "Variable skipped in %s: dataset=%d, variable='%s'",
-                        path_obj.name,
-                        dataset_index,
-                        data_var_name,
-                    )
-                    continue
-
-                result.recognized_variable_count += 1
-                interpolated_values = _idw_interpolate_dataarray(
-                    da,
-                    target_lat=latitude,
-                    target_lon=longitude,
-                    power=idw_power,
-                )
-                time_values = _extract_time_values(da, dataset=ds)
-
-                if len(time_values) != len(interpolated_values):
-                    if len(time_values) == 1 and len(interpolated_values) > 1:
-                        time_values = time_values * len(interpolated_values)
-                    elif len(interpolated_values) == 1 and len(time_values) > 1:
-                        interpolated_values = np.repeat(interpolated_values[0], len(time_values))
-                    else:
-                        min_len = min(len(time_values), len(interpolated_values))
-                        time_values = time_values[:min_len]
-                        interpolated_values = interpolated_values[:min_len]
-
-                for valid_time, value in zip(time_values, interpolated_values):
-                    if pd.isna(valid_time):
-                        time_key = "NaT"
-                    else:
-                        time_key = pd.Timestamp(valid_time).strftime("%Y-%m-%d %H:%M:%S")
-
-                    if time_key not in data_records:
-                        data_records[time_key] = {}
-                    data_records[time_key][var_key] = float(value) if np.isfinite(value) else None
-            except Exception as exc:
-                result.variable_error_count += 1
-                logging.warning("Error processing variable '%s' in %s: %s", data_var_name, path_obj, exc)
-                continue
-
-        try:
-            ds.close()
-        except Exception:
-            pass
-
-    if not data_records:
-        logging.warning(
-            "Extraction produced no usable rows for %s. open_ok=%s, datasets=%d, inspected_variables=%d, recognized_variables=%d, skipped_variables=%d, variable_errors=%d",
-            path_obj,
-            result.open_ok,
-            result.dataset_count,
-            result.inspected_variable_count,
-            result.recognized_variable_count,
-            result.skipped_variable_count,
-            result.variable_error_count,
-        )
-        return result
-
-    records = []
-    for dt_value, vars_data in data_records.items():
-        row = {"datetime": dt_value}
-        for var_name in VARIABLES.keys():
-            row[var_name] = vars_data.get(var_name, None)
-        records.append(row)
-
-    df = pd.DataFrame(records)
-    if not df.empty:
-        result.dataframe = df
-        result.extracted_timestamp_count = len(df)
-
-    logging.info(
-        "Extraction succeeded for %s. datasets=%d, inspected_variables=%d, recognized_variables=%d, extracted_timestamps=%d",
-        path_obj,
-        result.dataset_count,
-        result.inspected_variable_count,
-        result.recognized_variable_count,
-        result.extracted_timestamp_count,
-    )
+        duplicate_block = dataframe.loc[:, dataframe.columns == column]
+        if isinstance(duplicate_block, pd.Series):
+            result[column] = duplicate_block
+        elif duplicate_block.shape[1] == 1:
+            result[column] = duplicate_block.iloc[:, 0]
+        else:
+            result[column] = duplicate_block.bfill(axis=1).iloc[:, 0]
     return result
 
 
-def run_extract_only(config: Era5Config, reporter: ProgressReporter) -> Path:
-    config.data_dir.mkdir(parents=True, exist_ok=True)
-    config.results_dir.mkdir(parents=True, exist_ok=True)
+def _standardize_and_index_member(
+    raw_dataframe: "pd.DataFrame",
+    source_label: str,
+    reporter: ProgressReporter,
+) -> "pd.DataFrame":
+    standardized = standardize_dataframe(raw_dataframe)
+    reporter.log(f"Mapped columns for processing ({source_label}): {', '.join(standardized.columns)}")
 
-    output_csv = config.output_csv
-    if output_csv.exists():
-        output_csv.unlink()
-        reporter.log(f"Deleted previous CSV output: {output_csv}")
+    standardized["datetime"] = _parse_datetime_series(standardized["datetime"])
+    standardized = standardized.dropna(subset=["datetime"]).copy()
+    _ensure_numeric(standardized, ["swh", "mwd", "mwp", "u10", "v10"])
 
-    grib_files = sorted(
-        str(config.data_dir / file_name)
-        for file_name in os.listdir(config.data_dir)
-        if file_name.lower().endswith(GRIB_EXTENSIONS)
+    keep = [column for column in MERGED_COLUMNS if column in standardized.columns]
+    if len(keep) <= 1:
+        raise RuntimeError(f"Table member '{source_label}' does not contain recognised ERA5 variable columns.")
+
+    standardized = standardized[keep].copy()
+    standardized = standardized.sort_values("datetime").drop_duplicates(subset=["datetime"], keep="first")
+    return standardized.set_index("datetime")
+
+
+def _prepare_standardized_dataframe(
+    raw_dataframe: "pd.DataFrame",
+    source_label: str,
+    reporter: ProgressReporter,
+) -> "pd.DataFrame":
+    standardized = standardize_dataframe(raw_dataframe)
+    reporter.log(f"Mapped columns for processing ({source_label}): {', '.join(standardized.columns)}")
+
+    standardized["datetime"] = _parse_datetime_series(standardized["datetime"])
+    standardized = standardized.dropna(subset=["datetime"]).copy()
+    _ensure_numeric(standardized, ["swh", "mwd", "mwp", "u10", "v10"])
+    return standardized
+
+
+def _require_non_empty_columns(dataframe: "pd.DataFrame", columns: Iterable[str], source_label: str) -> None:
+    missing = [column for column in columns if column not in dataframe.columns]
+    if missing:
+        raise RuntimeError(
+            f"The {source_label} CSV does not contain the required columns: {', '.join(missing)}. "
+            "The CDS response did not include all expected wave/wind variables."
+        )
+
+    empty = [column for column in columns if int(dataframe[column].notna().sum()) == 0]
+    if empty:
+        raise RuntimeError(
+            f"The {source_label} CSV contains only empty values for: {', '.join(empty)}. "
+            "The run has stopped to avoid creating an incomplete output.csv."
+        )
+
+
+# -----------------------------------------------------------------------------
+# File writing and lock checks
+# -----------------------------------------------------------------------------
+
+def _format_lock_message(path: Path, label: str) -> str:
+    return (
+        f"Permission denied while writing {label}: {path}. "
+        "Close the file if it is open in Excel, LibreOffice, a text editor, "
+        "Windows Preview pane or another process, then run the downloader again."
     )
-    if not grib_files:
-        raise FileNotFoundError(f"No GRIB files found in '{config.data_dir}'.")
-
-    reporter.status("Extracting existing GRIB files...")
-    reporter.log(f"Found {len(grib_files)} local GRIB files in {config.data_dir}")
-
-    dataframes: List[pd.DataFrame] = []
-    completed = 0
-    max_workers = max(1, (os.cpu_count() or 1))
-
-    with ProcessPoolExecutor(max_workers=max_workers) as executor:
-        futures = {
-            executor.submit(process_grib_file_df, file_path, config.latitude, config.longitude, config.idw_power, str(config.log_file)): file_path
-            for file_path in grib_files
-        }
-
-        for future in as_completed(futures):
-            file_name = Path(futures[future]).name
-            try:
-                result = future.result(timeout=config.timeout_per_file)
-                if result.has_data:
-                    dataframes.append(result.dataframe)
-                _report_process_result(result, reporter, include_download_context=False)
-            except TimeoutError:
-                reporter.log(f"Extraction timed out for {file_name}")
-                future.cancel()
-            except Exception as exc:
-                reporter.log(f"Extraction crashed for {file_name}: {exc}")
-
-            completed += 1
-            reporter.progress(completed, len(grib_files), f"Processed {completed}/{len(grib_files)} files")
-
-    if not dataframes:
-        raise RuntimeError("No data was extracted from any GRIB file.")
-
-    final_df = pd.concat(dataframes, ignore_index=True)
-    final_df["datetime"] = pd.to_datetime(final_df["datetime"], errors="coerce")
-    final_df.sort_values(by="datetime", inplace=True)
-    final_df.to_csv(output_csv, index=False)
-    reporter.log(f"CSV written to {output_csv}")
-    return output_csv
 
 
-def run_download_and_process(config: Era5Config, reporter: ProgressReporter) -> Path:
-    config.data_dir.mkdir(parents=True, exist_ok=True)
-    config.results_dir.mkdir(parents=True, exist_ok=True)
+def _check_output_path_is_writable(path: Path, label: str) -> None:
+    """Detect locked output files before starting the CDS download."""
 
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        test_path = path.parent / f".__write_test_{path.name}.tmp"
+        with test_path.open("w", encoding="utf-8", newline="") as handle:
+            handle.write("test\n")
+        try:
+            test_path.unlink()
+        except FileNotFoundError:
+            pass
+
+        if path.exists():
+            with path.open("a", encoding="utf-8", newline=""):
+                pass
+    except PermissionError as exc:
+        raise RuntimeError(_format_lock_message(path, label)) from exc
+    except OSError as exc:
+        raise RuntimeError(f"Cannot write {label} at {path}: {exc}") from exc
+
+
+def _preflight_output_files(config: Era5Config, reporter: ProgressReporter) -> None:
+    reporter.status("Checking output files...")
+    _check_output_path_is_writable(config.raw_csv_path, "era5_data.csv")
+    _check_output_path_is_writable(config.output_csv_path, "output.csv")
+    reporter.log("Output files are writable.")
+
+
+def _write_dataframe_csv_safely(dataframe: "pd.DataFrame", path: Path, label: str) -> None:
+    """Write CSV via a temporary file, then replace the final file."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = path.with_name(f".{path.stem}.writing{path.suffix}")
+
+    try:
+        if temporary_path.exists():
+            temporary_path.unlink()
+        dataframe.to_csv(temporary_path, index=False, lineterminator="\n")
+        temporary_path.replace(path)
+    except PermissionError as exc:
+        try:
+            temporary_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        raise RuntimeError(_format_lock_message(path, label)) from exc
+    except OSError as exc:
+        try:
+            temporary_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        raise RuntimeError(f"Could not write {label} at {path}: {exc}") from exc
+
+
+# -----------------------------------------------------------------------------
+# CDS request and processing pipeline
+# -----------------------------------------------------------------------------
+
+def _build_cds_request(config: Era5Config) -> dict[str, object]:
+    return {
+        "variable": ERA5_VARIABLES,
+        "location": {"longitude": config.longitude, "latitude": config.latitude},
+        "date": [f"{config.start_date}/{config.end_date}"],
+        "data_format": "csv",
+    }
+
+
+def _download_cds_payload(
+    client: "cdsapi.Client",
+    config: Era5Config,
+    payload_path: Path,
+    reporter: ProgressReporter,
+) -> Path:
+    request = _build_cds_request(config)
+    reporter.status("Downloading ERA5 data from CDS...")
+    reporter.progress(1, TOTAL_PROGRESS_STEPS, "Downloading CDS payload")
+    reporter.log("Requested variables: " + ", ".join(ERA5_VARIABLES))
+    reporter.log(f"Target point: lon={config.longitude:.8f}, lat={config.latitude:.8f}")
+    reporter.log(f"Date range: {config.start_date} to {config.end_date}")
+
+    if payload_path.exists():
+        payload_path.unlink()
+
+    result = client.retrieve(DATASET_NAME, request)
+    result.download(str(payload_path))
+
+    if not payload_path.exists() or payload_path.stat().st_size == 0:
+        raise RuntimeError(f"{payload_path.name} was not created on disk.")
+
+    reporter.log(f"Downloaded CDS response to: {payload_path}")
+    return payload_path
+
+
+def _normalize_cds_payload_to_merged_csv(
+    payload_path: Path,
+    merged_csv_path: Path,
+    reporter: ProgressReporter,
+) -> Path:
+    reporter.status("Reading and merging CDS payload...")
+    reporter.progress(2, TOTAL_PROGRESS_STEPS, "Reading CDS tables and merging by datetime")
+
+    raw_frames = _read_tables_from_cds_payload(payload_path, reporter)
+    if not raw_frames:
+        raise RuntimeError("No usable tables were found in the CDS payload.")
+
+    merged_indexed: Optional[pd.DataFrame] = None
+    used_members = 0
+    skipped_messages: list[str] = []
+
+    for index, raw_dataframe in enumerate(raw_frames, start=1):
+        label = f"CDS table {index}"
+        try:
+            part = _standardize_and_index_member(raw_dataframe, label, reporter)
+        except Exception as exc:
+            skipped_messages.append(f"{label}: {exc}")
+            continue
+
+        used_members += 1
+        if merged_indexed is None:
+            merged_indexed = part
+        else:
+            merged_indexed = _coalesce_duplicate_columns(merged_indexed.combine_first(part))
+
+    for message in skipped_messages:
+        reporter.log("Skipped payload table: " + message)
+
+    if merged_indexed is None or merged_indexed.empty:
+        raise RuntimeError("No recognised ERA5 variables could be extracted from the CDS payload.")
+
+    merged_dataframe = merged_indexed.reset_index().sort_values("datetime").reset_index(drop=True)
+    for column in ["swh", "mwd", "mwp", "u10", "v10"]:
+        if column not in merged_dataframe.columns:
+            merged_dataframe[column] = np.nan
+
+    merged_dataframe = merged_dataframe[MERGED_COLUMNS].copy()
+    merged_dataframe["datetime"] = pd.to_datetime(
+        merged_dataframe["datetime"],
+        errors="coerce",
+    ).dt.strftime("%Y-%m-%d %H:%M:%S")
+
+    _write_dataframe_csv_safely(merged_dataframe, merged_csv_path, "era5_data.csv")
+    reporter.log(f"Merged {used_members} CDS table(s) into: {merged_csv_path}")
+    reporter.log("Non-empty values in era5_data.csv: " + _non_null_summary(merged_dataframe))
+    return merged_csv_path
+
+
+def download_raw_csv(config: Era5Config, reporter: ProgressReporter) -> Path:
     reporter.status("Initializing CDS client...")
     client = initialize_cds_client()
-    reporter.log("CDS API client initialized successfully.")
+    reporter.log("CDS API client initialized.")
+    program_path = Path(sys.executable).resolve() if getattr(sys, "frozen", False) else Path(__file__).resolve()
+    reporter.log(f"Program file: {program_path}")
+    reporter.log(f"Application/output directory: {SCRIPT_DIR}")
+    reporter.log(f"Dataset: {DATASET_NAME}")
 
-    variable_list = [spec["request_code"] for spec in VARIABLES.values()]
-    output_csv = config.output_csv
-    area = config.area
+    try:
+        _download_cds_payload(client, config, TEMP_PAYLOAD, reporter)
+        _normalize_cds_payload_to_merged_csv(TEMP_PAYLOAD, config.raw_csv_path, reporter)
+    finally:
+        try:
+            if TEMP_PAYLOAD.exists():
+                TEMP_PAYLOAD.unlink()
+                reporter.log(f"Removed temporary CDS payload: {TEMP_PAYLOAD}")
+        except OSError as exc:
+            reporter.log(f"Could not remove temporary CDS payload {TEMP_PAYLOAD}: {exc}")
 
-    reporter.log(
-        "Using ERA5-aligned request window: "
-        f"north={area[0]}, west={area[1]}, south={area[2]}, east={area[3]}"
-    )
-    reporter.log(
-        "Grid points (lon, lat): " + ", ".join(format_lon_lat_pair(lon, lat) for lat, lon in config.surrounding_points)
-    )
+    if not config.raw_csv_path.exists() or config.raw_csv_path.stat().st_size == 0:
+        raise RuntimeError("era5_data.csv was not created on disk.")
 
-    rows_accumulated: List[pd.DataFrame] = []
-    total_requests = len(config.years) * 12
-    done = 0
-
-    for year in config.years:
-        for month in range(1, 13):
-            reporter.status(f"Downloading {year}-{month:02d}...")
-            file_path = download_monthly_data(
-                client=client,
-                year=year,
-                month=month,
-                variable_list=variable_list,
-                area=area,
-                grid=config.grid,
-                output_dir=config.data_dir,
-                request_delay=config.request_delay,
-                max_retries=config.max_retries,
-                reporter=reporter,
-            )
-
-            if file_path:
-                result = process_grib_file_df(str(file_path), config.latitude, config.longitude, config.idw_power, str(config.log_file))
-                if result.has_data:
-                    rows_accumulated.append(result.dataframe)
-                _report_process_result(result, reporter, include_download_context=True)
-            else:
-                reporter.log(f"Download failed for {year}-{month:02d}. Monthly step skipped before extraction.")
-
-            done += 1
-            reporter.progress(done, total_requests, f"Completed {done}/{total_requests} monthly steps")
-            time.sleep(config.request_delay)
-
-    if not rows_accumulated:
-        raise RuntimeError("No data was downloaded/extracted successfully.")
-
-    final_df = pd.concat(rows_accumulated, ignore_index=True)
-    final_df["datetime"] = pd.to_datetime(final_df["datetime"], errors="coerce")
-    final_df.sort_values(by="datetime", inplace=True)
-    final_df.to_csv(output_csv, index=False)
-    reporter.log(f"CSV written to {output_csv}")
-    return output_csv
+    return config.raw_csv_path
 
 
-def execute_pipeline(mode: str, config: Era5Config, callback: Optional[Callable[[str, Dict], None]] = None) -> Path:
+def _non_null_summary(dataframe: "pd.DataFrame") -> str:
+    columns = [column for column in ["swh", "mwd", "mwp", "u10", "v10"] if column in dataframe.columns]
+    return ", ".join(f"{column}={int(dataframe[column].notna().sum())}" for column in columns)
+
+
+def build_output_csv(config: Era5Config, reporter: ProgressReporter) -> Path:
+    reporter.status("Building output.csv...")
+    reporter.progress(3, TOTAL_PROGRESS_STEPS, "Reading era5_data.csv and writing output.csv")
+    reporter.log(f"Reading merged CSV: {config.raw_csv_path}")
+
+    raw_dataframe = read_csv_robust(config.raw_csv_path)
+    standardized = _prepare_standardized_dataframe(raw_dataframe, "merged ERA5 CSV", reporter)
+    _require_non_empty_columns(standardized, ["swh", "mwd", "mwp", "u10", "v10"], "merged ERA5")
+
+    standardized["wind"] = np.sqrt(standardized["u10"] ** 2 + standardized["v10"] ** 2)
+    standardized["dwi"] = _meteorological_direction_from_uv(standardized["u10"], standardized["v10"])
+
+    for column in OUTPUT_COLUMNS:
+        if column not in standardized.columns:
+            standardized[column] = np.nan
+
+    output_dataframe = standardized[OUTPUT_COLUMNS].copy()
+    output_dataframe = output_dataframe.sort_values("datetime").drop_duplicates(
+        subset=["datetime"],
+        keep="first",
+    ).reset_index(drop=True)
+    output_dataframe["datetime"] = output_dataframe["datetime"].dt.strftime("%Y-%m-%d %H:%M:%S")
+
+    _write_dataframe_csv_safely(output_dataframe, config.output_csv_path, "output.csv")
+
+    if not config.output_csv_path.exists() or config.output_csv_path.stat().st_size == 0:
+        raise RuntimeError("output.csv was not created on disk.")
+
+    reporter.log("Non-empty values in output.csv: " + _non_null_summary(output_dataframe))
+    reporter.log(f"Saved processed CSV to: {config.output_csv_path}")
+    return config.output_csv_path
+
+
+def execute_pipeline(
+    config: Era5Config,
+    callback: Optional[ProgressCallback] = None,
+) -> Path:
     setup_logging(config.log_file)
     reporter = ProgressReporter(callback)
-    reporter.log("Starting ERA5 workflow.")
-    validate_runtime_dependencies(mode=mode, wants_gui=False, reporter=reporter)
-    target_point_text = format_target_point(config.longitude, config.latitude)
-    reporter.log(f"Target point: {target_point_text}")
+    reporter.log("Starting ERA5 single-point workflow.")
+    _preflight_output_files(config, reporter)
+    download_raw_csv(config, reporter)
+    output_path = build_output_csv(config, reporter)
+    reporter.progress(TOTAL_PROGRESS_STEPS, TOTAL_PROGRESS_STEPS, "Completed")
+    return output_path
 
-    if mode == "extract":
-        return run_extract_only(config, reporter)
-    if mode == "download":
-        return run_download_and_process(config, reporter)
-    raise ValueError(f"Unsupported mode: {mode}")
+
+# -----------------------------------------------------------------------------
+# Graphical interface
+# -----------------------------------------------------------------------------
+
+class TkTextWriter:
+    """Small file-like adapter for writing text into a Tkinter text widget."""
+
+    def __init__(self, text_widget: "tk.Text") -> None:
+        self.text_widget = text_widget
+
+    def write(self, text: object) -> int:
+        message = str(text)
+        if not message:
+            return 0
+        try:
+            self.text_widget.configure(state="normal")
+            self.text_widget.insert("end", message)
+            self.text_widget.see("end")
+            self.text_widget.configure(state="disabled")
+        except Exception:
+            return 0
+        return len(message)
+
+    def flush(self) -> None:
+        try:
+            self.text_widget.update_idletasks()
+        except Exception:
+            pass
 
 
 class Era5DownloaderGUI:
+    """Tkinter GUI wrapper around the ERA5 processing pipeline."""
+
     def __init__(self, root: "tk.Tk") -> None:
         self.root = root
-        self.root.title("ERA5 Hourly Downloader and Extractor")
+        self.root.title("ERA5 Single-Point CSV Downloader")
         self.root.geometry(f"{DEFAULT_WINDOW_WIDTH}x{DEFAULT_WINDOW_HEIGHT}")
         self.root.minsize(DEFAULT_WINDOW_MIN_WIDTH, DEFAULT_WINDOW_MIN_HEIGHT)
+        self.root.maxsize(DEFAULT_WINDOW_WIDTH, DEFAULT_WINDOW_HEIGHT)
+        self.root.resizable(False, False)
 
-        self.message_queue: "queue.Queue[Tuple[str, Dict]]" = queue.Queue()
+        self.message_queue: queue.Queue[tuple[str, dict[str, object]]] = queue.Queue()
         self.worker_thread: Optional[threading.Thread] = None
+        self.run_start_monotonic: Optional[float] = None
 
-        self.mode_var = tk.StringVar(value=INITIAL_MODE)
         self.longitude_var = tk.StringVar(value=f"{INITIAL_LONGITUDE:.8f}")
         self.latitude_var = tk.StringVar(value=f"{INITIAL_LATITUDE:.8f}")
-        self.start_year_var = tk.StringVar(value=str(INITIAL_START_YEAR))
-        self.end_year_var = tk.StringVar(value=str(INITIAL_END_YEAR))
-        self.data_dir_var = tk.StringVar(value=INITIAL_DATA_DIR)
-        self.results_dir_var = tk.StringVar(value=INITIAL_RESULTS_DIR)
-        self.output_csv_var = tk.StringVar(value=INITIAL_OUTPUT_CSV_NAME)
-        self.log_file_var = tk.StringVar(value=INITIAL_LOG_FILE)
-        self.status_var = tk.StringVar(value="Ready. Configure the run and click Start.")
-        self.grid_info_var = tk.StringVar(value="ERA5 request window will be shown after validation.")
+        self.start_date_var = tk.StringVar(value=INITIAL_START_DATE)
+        self.end_date_var = tk.StringVar(value=INITIAL_END_DATE)
+        self.status_var = tk.StringVar(value="Ready.")
         self.progress_label_var = tk.StringVar(value="Idle")
         self.eta_label_var = tk.StringVar(value="Estimated completion time: not available yet.")
-        self.run_start_monotonic: Optional[float] = None
-        self.last_progress_current = 0
 
         self._configure_style()
         self._build_header()
         self._build_body()
         self._build_footer()
-        self._freeze_initial_geometry()
-        self._refresh_grid_summary()
+        self._append_log("Log window ready.")
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.after(150, self._poll_messages)
-
-    def _freeze_initial_geometry(self) -> None:
-        """Lock the initial geometry so widget content does not resize the window."""
-        self.root.update_idletasks()
-        width = max(self.root.winfo_width(), self.root.winfo_reqwidth(), DEFAULT_WINDOW_WIDTH)
-        height = max(self.root.winfo_height(), self.root.winfo_reqheight(), DEFAULT_WINDOW_HEIGHT)
-        self.root.geometry(f"{width}x{height}")
-        self.root.minsize(width, height)
 
     def _configure_style(self) -> None:
         style = ttk.Style(self.root)
@@ -1199,26 +1223,37 @@ class Era5DownloaderGUI:
         style.configure("TButton", padding=(10, 6), font=("Segoe UI", 10))
         style.configure("TLabel", font=("Segoe UI", 10))
         style.configure("Small.TLabel", font=("Segoe UI", 9))
-        style.configure("Status.TLabel", font=("Segoe UI", 10))
+
+    @staticmethod
+    def _freeze_widget_size(widget: object) -> None:
+        """Prevent child widgets from changing the allocated widget size."""
+
+        for method_name in ("pack_propagate", "grid_propagate"):
+            method = getattr(widget, method_name, None)
+            if callable(method):
+                try:
+                    method(False)
+                except Exception:
+                    pass
 
     def _build_header(self) -> None:
-        header = tk.Frame(self.root, bg="#1f3b5b", padx=16, pady=14)
+        header = tk.Frame(self.root, bg="#1f3b5b", padx=16, pady=12, height=HEADER_HEIGHT)
         header.pack(fill="x")
+        self._freeze_widget_size(header)
 
         tk.Label(
             header,
-            text="ERA5 Hourly Data Downloader and Extractor",
+            text="ERA5 Single-Point CSV Downloader",
             bg="#1f3b5b",
             fg="white",
             font=("Segoe UI", 18, "bold"),
             anchor="w",
         ).pack(fill="x")
-
         tk.Label(
             header,
             text=(
-                "Production GUI for ERA5 download and extraction with integrated "
-                "progress reporting, logging, and request validation."
+                "Single CDS request; ZIP/CSV responses are merged automatically. "
+                "Outputs are written in the script directory."
             ),
             bg="#1f3b5b",
             fg="#d7e6f5",
@@ -1228,16 +1263,26 @@ class Era5DownloaderGUI:
         ).pack(fill="x", pady=(4, 0))
 
     def _build_body(self) -> None:
-        outer = ttk.Frame(self.root, padding=12)
-        outer.pack(fill="both", expand=True)
+        outer = ttk.Frame(
+            self.root,
+            padding=12,
+            width=BODY_FRAME_WIDTH,
+            height=BODY_FRAME_HEIGHT,
+        )
+        outer.pack(fill="both", expand=False)
+        self._freeze_widget_size(outer)
 
-        self.notebook = ttk.Notebook(outer)
-        self.notebook.pack(fill="both", expand=True)
+        self.notebook = ttk.Notebook(
+            outer,
+            width=BODY_FRAME_WIDTH - 24,
+            height=BODY_FRAME_HEIGHT - 24,
+        )
+        self.notebook.pack(fill="both", expand=False)
+        self._freeze_widget_size(self.notebook)
 
         self.run_tab = ttk.Frame(self.notebook, padding=14)
         self.log_tab = ttk.Frame(self.notebook, padding=14)
         self.instructions_tab = ttk.Frame(self.notebook, padding=14)
-
         self.notebook.add(self.run_tab, text="Run")
         self.notebook.add(self.log_tab, text="Log")
         self.notebook.add(self.instructions_tab, text="Instructions")
@@ -1247,254 +1292,231 @@ class Era5DownloaderGUI:
         self._build_instructions_tab()
 
     def _build_run_tab(self) -> None:
-        self.run_tab.columnconfigure(0, weight=3)
-        self.run_tab.columnconfigure(1, weight=2)
+        self.run_tab.columnconfigure(0, minsize=RUN_LEFT_WIDTH, weight=0)
+        self.run_tab.columnconfigure(1, minsize=RUN_RIGHT_WIDTH, weight=0)
+        self.run_tab.rowconfigure(0, minsize=RUN_PANEL_HEIGHT, weight=0)
 
-        left = ttk.Frame(self.run_tab)
-        right = ttk.Frame(self.run_tab)
-        left.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
-        right.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
-        left.columnconfigure(0, weight=1)
-        right.columnconfigure(0, weight=1)
+        left = ttk.Frame(self.run_tab, width=RUN_LEFT_WIDTH, height=RUN_PANEL_HEIGHT)
+        right = ttk.Frame(self.run_tab, width=RUN_RIGHT_WIDTH, height=RUN_PANEL_HEIGHT)
+        left.grid(row=0, column=0, sticky="nw", padx=(0, 8))
+        right.grid(row=0, column=1, sticky="nw", padx=(8, 0))
+        self._freeze_widget_size(left)
+        self._freeze_widget_size(right)
+        left.columnconfigure(0, minsize=RUN_LEFT_WIDTH, weight=0)
+        right.columnconfigure(0, minsize=RUN_RIGHT_WIDTH, weight=0)
 
-        mode_card = ttk.LabelFrame(left, text="Mode", style="Card.TLabelframe")
-        mode_card.grid(row=0, column=0, sticky="ew")
-        ttk.Radiobutton(mode_card, text="Download from CDS and process", value="download", variable=self.mode_var).grid(row=0, column=0, sticky="w", pady=4)
-        ttk.Radiobutton(mode_card, text="Extract existing GRIB files only", value="extract", variable=self.mode_var).grid(row=1, column=0, sticky="w", pady=4)
+        self._build_point_card(left)
+        self._build_action_card(right)
+        self._build_progress_card(right)
 
-        point_card = ttk.LabelFrame(left, text="Target point and time range", style="Card.TLabelframe")
-        point_card.grid(row=1, column=0, sticky="ew", pady=(12, 0))
-        point_card.columnconfigure(1, weight=1, minsize=220)
+    def _build_point_card(self, parent: "ttk.Frame") -> None:
+        point_card = ttk.LabelFrame(
+            parent,
+            text="Target point and date range",
+            style="Card.TLabelframe",
+            width=POINT_CARD_WIDTH,
+            height=POINT_CARD_HEIGHT,
+        )
+        point_card.grid(row=0, column=0, sticky="nw")
+        self._freeze_widget_size(point_card)
+        point_card.columnconfigure(1, minsize=300, weight=0)
 
-        ttk.Label(point_card, text="Longitude").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=6)
-        lon_entry = ttk.Entry(point_card, textvariable=self.longitude_var, width=DEFAULT_COORD_ENTRY_WIDTH)
-        lon_entry.grid(row=0, column=1, sticky="ew", pady=6)
-        lon_entry.bind("<KeyRelease>", lambda _event: self._refresh_grid_summary())
-
-        ttk.Label(point_card, text="Latitude").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=6)
-        lat_entry = ttk.Entry(point_card, textvariable=self.latitude_var, width=DEFAULT_COORD_ENTRY_WIDTH)
-        lat_entry.grid(row=1, column=1, sticky="ew", pady=6)
-        lat_entry.bind("<KeyRelease>", lambda _event: self._refresh_grid_summary())
-
-        ttk.Label(point_card, text="Start year").grid(row=2, column=0, sticky="w", padx=(0, 8), pady=6)
-        ttk.Entry(point_card, textvariable=self.start_year_var, width=DEFAULT_YEAR_ENTRY_WIDTH).grid(row=2, column=1, sticky="ew", pady=6)
-
-        ttk.Label(point_card, text="End year").grid(row=3, column=0, sticky="w", padx=(0, 8), pady=6)
-        ttk.Entry(point_card, textvariable=self.end_year_var, width=DEFAULT_YEAR_ENTRY_WIDTH).grid(row=3, column=1, sticky="ew", pady=6)
+        fields = [
+            ("Longitude", self.longitude_var),
+            ("Latitude", self.latitude_var),
+            ("Start date", self.start_date_var),
+            ("End date", self.end_date_var),
+        ]
+        for row_index, (label, variable) in enumerate(fields):
+            ttk.Label(point_card, text=label).grid(row=row_index, column=0, sticky="w", padx=(0, 8), pady=6)
+            ttk.Entry(point_card, textvariable=variable, width=24).grid(
+                row=row_index,
+                column=1,
+                sticky="w",
+                pady=6,
+            )
 
         ttk.Label(
             point_card,
-            textvariable=self.grid_info_var,
+            text="Files are fixed as era5_data.csv, output.csv, download_era5_data.log and defaults.json.",
             style="Small.TLabel",
-            wraplength=520,
+            wraplength=500,
             justify="left",
         ).grid(row=4, column=0, columnspan=2, sticky="w", pady=(8, 2))
 
-        paths_card = ttk.LabelFrame(left, text="Folders and output", style="Card.TLabelframe")
-        paths_card.grid(row=2, column=0, sticky="ew", pady=(12, 0))
-        paths_card.columnconfigure(1, weight=1, minsize=360)
+    def _build_action_card(self, parent: "ttk.Frame") -> None:
+        action_card = ttk.LabelFrame(
+            parent,
+            text="Actions",
+            style="Card.TLabelframe",
+            width=ACTION_CARD_WIDTH,
+            height=ACTION_CARD_HEIGHT,
+        )
+        action_card.grid(row=0, column=0, sticky="nw")
+        self._freeze_widget_size(action_card)
+        action_card.columnconfigure(0, minsize=ACTION_CARD_WIDTH - 28, weight=0)
 
-        ttk.Label(paths_card, text="GRIB folder").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=6)
-        ttk.Entry(paths_card, textvariable=self.data_dir_var, width=DEFAULT_PATH_ENTRY_WIDTH).grid(row=0, column=1, sticky="ew", pady=6)
-        ttk.Button(paths_card, text="Browse", command=self._browse_data_dir).grid(row=0, column=2, sticky="ew", padx=(8, 0), pady=6)
-
-        ttk.Label(paths_card, text="Results folder").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=6)
-        ttk.Entry(paths_card, textvariable=self.results_dir_var, width=DEFAULT_PATH_ENTRY_WIDTH).grid(row=1, column=1, sticky="ew", pady=6)
-        ttk.Button(paths_card, text="Browse", command=self._browse_results_dir).grid(row=1, column=2, sticky="ew", padx=(8, 0), pady=6)
-
-        ttk.Label(paths_card, text="Output CSV name").grid(row=2, column=0, sticky="w", padx=(0, 8), pady=6)
-        ttk.Entry(paths_card, textvariable=self.output_csv_var, width=DEFAULT_PATH_ENTRY_WIDTH).grid(row=2, column=1, columnspan=2, sticky="ew", pady=6)
-
-        ttk.Label(paths_card, text="Log file").grid(row=3, column=0, sticky="w", padx=(0, 8), pady=6)
-        ttk.Entry(paths_card, textvariable=self.log_file_var, width=DEFAULT_PATH_ENTRY_WIDTH).grid(row=3, column=1, sticky="ew", pady=6)
-        ttk.Button(paths_card, text="Browse", command=self._browse_log_file).grid(row=3, column=2, sticky="ew", padx=(8, 0), pady=6)
-
-        action_card = ttk.LabelFrame(right, text="Actions", style="Card.TLabelframe")
-        action_card.grid(row=0, column=0, sticky="new")
-        action_card.columnconfigure(0, weight=1)
-
-        self.start_button = ttk.Button(action_card, text="Start", style="Primary.TButton", command=self.start_run)
+        self.start_button = ttk.Button(
+            action_card,
+            text="Start",
+            style="Primary.TButton",
+            command=self.start_run,
+        )
         self.start_button.grid(row=0, column=0, sticky="ew", pady=(0, 8))
-        ttk.Button(action_card, text="Open Log tab", command=lambda: self.notebook.select(self.log_tab)).grid(row=1, column=0, sticky="ew", pady=4)
-        ttk.Button(action_card, text="Refresh request summary", command=self._refresh_grid_summary).grid(row=2, column=0, sticky="ew", pady=4)
-        ttk.Button(action_card, text="Quit", command=self.root.destroy).grid(row=3, column=0, sticky="ew", pady=4)
-
-        summary_card = ttk.LabelFrame(right, text="Current request profile", style="Card.TLabelframe")
-        summary_card.grid(row=1, column=0, sticky="new", pady=(12, 0))
-        ttk.Label(
-            summary_card,
-            text=(
-                "Spatial request:\n"
-                "- ERA5 grid step: 0.25°\n"
-                "- request mode: 4 surrounding points (2x2)\n"
-                "- interpolation: inverse distance weighting (IDW)\n\n"
-                "Operational notes:\n"
-                "- download mode handles one month per request\n"
-                "- extract mode scans the selected GRIB folder\n"
-                "- output CSV is sorted by datetime"
-            ),
-            justify="left",
-        ).pack(fill="x")
-
-        progress_card = ttk.LabelFrame(right, text="Progress", style="Card.TLabelframe")
-        progress_card.grid(row=2, column=0, sticky="new", pady=(12, 0))
-        self.progress_bar = ttk.Progressbar(progress_card, mode="determinate", maximum=100)
-        self.progress_bar.pack(fill="x", pady=(0, 8))
-        ttk.Label(progress_card, textvariable=self.progress_label_var, justify="left", wraplength=300).pack(fill="x")
-        ttk.Label(progress_card, textvariable=self.eta_label_var, justify="left", wraplength=300).pack(fill="x", pady=(6, 0))
-
-    def _format_eta_text(self, current: int, total: int) -> str:
-        if self.run_start_monotonic is None or current <= 0 or total <= 0:
-            return "Estimated completion time: not available yet."
-
-        elapsed_seconds = max(0.0, time.monotonic() - self.run_start_monotonic)
-        average_seconds_per_step = elapsed_seconds / float(current)
-        remaining_steps = max(0, total - current)
-        remaining_seconds = average_seconds_per_step * remaining_steps
-        eta_timestamp = time.time() + remaining_seconds
-        eta_dt = datetime.fromtimestamp(eta_timestamp)
-        eta_clock = eta_dt.strftime("%H:%M:%S")
-
-        if eta_dt.date() == datetime.now().date():
-            day_suffix = ""
-        else:
-            day_suffix = eta_dt.strftime(" (%Y-%m-%d)")
-
-        return (
-            f"Estimated completion time: {eta_clock}{day_suffix} "
-            f"(average {average_seconds_per_step:.1f} s per completed file)"
+        ttk.Button(
+            action_card,
+            text="Open Log tab",
+            command=lambda: self.notebook.select(self.log_tab),
+        ).grid(row=1, column=0, sticky="ew", pady=4)
+        ttk.Button(action_card, text="Quit", command=self.root.destroy).grid(
+            row=2,
+            column=0,
+            sticky="ew",
+            pady=4,
         )
 
+    def _build_progress_card(self, parent: "ttk.Frame") -> None:
+        progress_card = ttk.LabelFrame(
+            parent,
+            text="Progress",
+            style="Card.TLabelframe",
+            width=PROGRESS_CARD_WIDTH,
+            height=PROGRESS_CARD_HEIGHT,
+        )
+        progress_card.grid(row=1, column=0, sticky="nw", pady=(12, 0))
+        self._freeze_widget_size(progress_card)
+
+        self.progress_bar = ttk.Progressbar(
+            progress_card,
+            mode="determinate",
+            maximum=100,
+            length=PROGRESS_CARD_WIDTH - 34,
+        )
+        self.progress_bar.pack(fill="x", pady=(0, 8))
+        ttk.Label(
+            progress_card,
+            textvariable=self.progress_label_var,
+            justify="left",
+            wraplength=PROGRESS_CARD_WIDTH - 34,
+        ).pack(fill="x")
+        ttk.Label(
+            progress_card,
+            textvariable=self.eta_label_var,
+            justify="left",
+            wraplength=PROGRESS_CARD_WIDTH - 34,
+        ).pack(fill="x", pady=(6, 0))
+
     def _build_log_tab(self) -> None:
-        log_frame = ttk.LabelFrame(self.log_tab, text="Execution log", style="Card.TLabelframe")
-        log_frame.pack(fill="both", expand=True)
+        frame = ttk.LabelFrame(
+            self.log_tab,
+            text="Execution log",
+            style="Card.TLabelframe",
+            width=LOG_FRAME_WIDTH,
+            height=LOG_FRAME_HEIGHT,
+        )
+        frame.pack(fill="both", expand=False)
+        self._freeze_widget_size(frame)
 
         self.log_box = scrolledtext.ScrolledText(
-            log_frame,
+            frame,
             wrap="word",
-            font=("Consolas", 13),
+            font=("Consolas", 11),
             padx=12,
             pady=12,
             borderwidth=0,
             relief="flat",
             background="white",
+            width=LOG_BOX_WIDTH_CHARS,
+            height=LOG_BOX_HEIGHT_LINES,
         )
         self.log_box.pack(fill="both", expand=True)
         self.log_box.configure(state="disabled")
+        self.log_writer = TkTextWriter(self.log_box)
 
     def _build_instructions_tab(self) -> None:
-        info_frame = ttk.LabelFrame(self.instructions_tab, text="Usage", style="Card.TLabelframe")
-        info_frame.pack(fill="both", expand=True)
-        text_box = scrolledtext.ScrolledText(
-            info_frame,
+        frame = ttk.LabelFrame(
+            self.instructions_tab,
+            text="Usage",
+            style="Card.TLabelframe",
+            width=INSTRUCTIONS_FRAME_WIDTH,
+            height=INSTRUCTIONS_FRAME_HEIGHT,
+        )
+        frame.pack(fill="both", expand=False)
+        self._freeze_widget_size(frame)
+
+        box = scrolledtext.ScrolledText(
+            frame,
             wrap="word",
-            font=("Consolas", 13),
+            font=("Consolas", 11),
             padx=12,
             pady=12,
             borderwidth=0,
             relief="flat",
             background="white",
+            width=INSTRUCTIONS_BOX_WIDTH_CHARS,
+            height=INSTRUCTIONS_BOX_HEIGHT_LINES,
         )
-        text_box.pack(fill="both", expand=True)
-        text_box.insert("1.0", INSTRUCTIONS_TEXT)
-        text_box.configure(state="disabled")
+        box.pack(fill="both", expand=True)
+        box.insert("1.0", INSTRUCTIONS_TEXT)
+        box.configure(state="disabled")
 
     def _build_footer(self) -> None:
-        footer = ttk.Frame(self.root, padding=(12, 0, 12, 12))
-        footer.pack(fill="x")
+        footer = ttk.Frame(self.root, padding=(12, 0, 12, 12), height=FOOTER_HEIGHT)
+        footer.pack(fill="x", expand=False)
+        self._freeze_widget_size(footer)
         ttk.Label(
             footer,
             textvariable=self.status_var,
-            style="Status.TLabel",
-            wraplength=920,
+            wraplength=FOOTER_WRAP_LENGTH,
             justify="left",
         ).pack(fill="x")
 
     def _append_log(self, message: str) -> None:
+        if not hasattr(self, "log_box"):
+            return
+        writer = getattr(self, "log_writer", None)
+        if writer is not None and hasattr(writer, "write"):
+            writer.write(message.rstrip() + "\n")
+            writer.flush()
+            return
+
         self.log_box.configure(state="normal")
         self.log_box.insert("end", message.rstrip() + "\n")
         self.log_box.see("end")
         self.log_box.configure(state="disabled")
-        self.root.update_idletasks()
 
-    def _browse_data_dir(self) -> None:
-        path = filedialog.askdirectory(initialdir=self.data_dir_var.get() or str(SCRIPT_DIR))
-        if path:
-            self.data_dir_var.set(path)
-
-    def _browse_results_dir(self) -> None:
-        path = filedialog.askdirectory(initialdir=self.results_dir_var.get() or str(SCRIPT_DIR))
-        if path:
-            self.results_dir_var.set(path)
-
-    def _browse_log_file(self) -> None:
-        path = filedialog.asksaveasfilename(
-            title="Select log file",
-            initialdir=str(SCRIPT_DIR),
-            initialfile=Path(self.log_file_var.get()).name,
-            defaultextension=".log",
-            filetypes=[("Log files", "*.log"), ("All files", "*.*")],
-        )
-        if path:
-            self.log_file_var.set(path)
-
-    def _collect_current_defaults(self) -> Dict[str, str]:
+    def _collect_defaults(self) -> dict[str, str]:
         return {
-            "mode": self.mode_var.get().strip() or HARDCODED_DEFAULTS["mode"],
-            "longitude": self.longitude_var.get().strip() or HARDCODED_DEFAULTS["longitude"],
-            "latitude": self.latitude_var.get().strip() or HARDCODED_DEFAULTS["latitude"],
-            "start_year": self.start_year_var.get().strip() or HARDCODED_DEFAULTS["start_year"],
-            "end_year": self.end_year_var.get().strip() or HARDCODED_DEFAULTS["end_year"],
-            "data_dir": self.data_dir_var.get().strip() or HARDCODED_DEFAULTS["data_dir"],
-            "results_dir": self.results_dir_var.get().strip() or HARDCODED_DEFAULTS["results_dir"],
-            "output_csv_name": self.output_csv_var.get().strip() or HARDCODED_DEFAULTS["output_csv_name"],
-            "log_file": self.log_file_var.get().strip() or HARDCODED_DEFAULTS["log_file"],
+            "longitude": self.longitude_var.get().strip(),
+            "latitude": self.latitude_var.get().strip(),
+            "start_date": self.start_date_var.get().strip(),
+            "end_date": self.end_date_var.get().strip(),
         }
 
-    def _persist_current_defaults(self) -> None:
-        try:
-            save_defaults(self._collect_current_defaults())
-        except Exception:
-            pass
-
     def _on_close(self) -> None:
-        self._persist_current_defaults()
+        try:
+            save_defaults(self._collect_defaults())
+        except OSError:
+            pass
         self.root.destroy()
 
-    def _refresh_grid_summary(self) -> None:
-        try:
-            latitude = float(self.latitude_var.get().strip())
-            longitude = float(self.longitude_var.get().strip())
-            north, west, south, east = compute_surrounding_four_point_area(latitude, longitude)
-            points = [(north, west), (north, east), (south, west), (south, east)]
-            points_text = "; ".join(format_lon_lat_pair(lon, lat) for lat, lon in points)
-            self.grid_info_var.set(
-                f"Request area: north={north:.5f}, west={west:.5f}, south={south:.5f}, east={east:.5f}\n"
-                f"Grid nodes (lon, lat): {points_text}"
-            )
-        except Exception:
-            self.grid_info_var.set("Enter valid longitude/latitude values to compute the ERA5 request window.")
-
     def _build_config(self) -> Era5Config:
-        latitude = float(self.latitude_var.get().strip())
         longitude = float(self.longitude_var.get().strip())
-        start_year = int(self.start_year_var.get().strip())
-        end_year = int(self.end_year_var.get().strip())
-        output_csv_name = self.output_csv_var.get().strip() or DEFAULT_OUTPUT_CSV_NAME
-        if start_year > end_year:
-            raise ValueError("Start year must be less than or equal to end year.")
+        latitude = float(self.latitude_var.get().strip())
+        start_date = self.start_date_var.get().strip()
+        end_date = self.end_date_var.get().strip()
 
-        save_defaults(self._collect_current_defaults())
+        datetime.fromisoformat(start_date)
+        datetime.fromisoformat(end_date)
+        if start_date > end_date:
+            raise ValueError("Start date must be less than or equal to end date.")
 
+        save_defaults(self._collect_defaults())
         return Era5Config(
             longitude=longitude,
             latitude=latitude,
-            start_year=start_year,
-            end_year=end_year,
-            data_dir=Path(self.data_dir_var.get().strip()).expanduser(),
-            results_dir=Path(self.results_dir_var.get().strip()).expanduser(),
-            output_csv_name=output_csv_name,
-            log_file=Path(self.log_file_var.get().strip()).expanduser(),
+            start_date=start_date,
+            end_date=end_date,
         )
 
     def start_run(self) -> None:
@@ -1508,30 +1530,12 @@ class Era5DownloaderGUI:
             messagebox.showerror("Invalid configuration", str(exc))
             return
 
-        self._append_log("=" * 72)
-        self._append_log("Preparing new run...")
-        self._append_log(
-            "Mode: {} | Target (lon, lat): ({:.8f}, {:.8f}) | Years: {}-{}".format(
-                self.mode_var.get(),
-                config.longitude,
-                config.latitude,
-                config.start_year,
-                config.end_year,
-            )
-        )
-        self.progress_bar["value"] = 0
-        self.progress_label_var.set("Starting...")
-        self.eta_label_var.set("Estimated completion time: calculating after the first completed file...")
-        self.run_start_monotonic = time.monotonic()
-        self.last_progress_current = 0
-        self.status_var.set("Running. Progress and detailed messages will appear below.")
-        self.start_button.state(["disabled"])
+        self._prepare_gui_for_run(config)
 
         def worker() -> None:
             try:
                 output_path = execute_pipeline(
-                    mode=self.mode_var.get(),
-                    config=config,
+                    config,
                     callback=lambda event, payload: self.message_queue.put((event, payload)),
                 )
                 self.message_queue.put(("done", {"output_path": str(output_path)}))
@@ -1541,117 +1545,137 @@ class Era5DownloaderGUI:
         self.worker_thread = threading.Thread(target=worker, daemon=True)
         self.worker_thread.start()
 
+    def _prepare_gui_for_run(self, config: Era5Config) -> None:
+        self._append_log("=" * 72)
+        self._append_log("Preparing new run...")
+        self._append_log(
+            f"Target (lon, lat): ({config.longitude:.8f}, {config.latitude:.8f}) | "
+            f"Dates: {config.start_date} to {config.end_date}"
+        )
+        self.progress_bar["value"] = 0
+        self.progress_label_var.set("Starting...")
+        self.eta_label_var.set("Estimated completion time: calculating after the first completed step...")
+        self.status_var.set("Running.")
+        self.start_button.state(["disabled"])
+        self.run_start_monotonic = time.monotonic()
+
+    def _format_eta_text(self, current: int, total: int) -> str:
+        if self.run_start_monotonic is None or current <= 0 or total <= 0:
+            return "Estimated completion time: not available yet."
+
+        elapsed = max(0.0, time.monotonic() - self.run_start_monotonic)
+        average_step_time = elapsed / float(current)
+        remaining = average_step_time * max(0, total - current)
+        eta = datetime.fromtimestamp(time.time() + remaining).strftime("%H:%M:%S")
+        return f"Estimated completion time: {eta}"
+
     def _poll_messages(self) -> None:
         try:
             while True:
                 event, payload = self.message_queue.get_nowait()
-                if event == "log":
-                    self._append_log(payload.get("message", ""))
-                elif event == "status":
-                    self.status_var.set(payload.get("message", ""))
-                elif event == "progress":
-                    total = max(1, int(payload.get("total", 1)))
-                    current = max(0, int(payload.get("current", 0)))
-                    if current > self.last_progress_current:
-                        self.last_progress_current = current
-                    self.progress_bar["value"] = max(0.0, min(100.0, current * 100.0 / total))
-                    self.progress_label_var.set(payload.get("message", f"{current}/{total}"))
-                    self.eta_label_var.set(self._format_eta_text(current, total))
-                elif event == "done":
-                    output_path = payload.get("output_path", "")
-                    self.status_var.set(f"Completed successfully. CSV written to: {output_path}")
-                    self.progress_bar["value"] = 100
-                    self.progress_label_var.set("Completed")
-                    self.eta_label_var.set("Estimated completion time: completed.")
-                    self.start_button.state(["!disabled"])
-                    self._append_log(f"Completed successfully. CSV written to: {output_path}")
-                    self.notebook.select(self.log_tab)
-                elif event == "error":
-                    message = payload.get("message", "Unknown error.")
-                    self.status_var.set(f"Run failed: {message}")
-                    self.progress_label_var.set("Failed")
-                    self.eta_label_var.set("Estimated completion time: unavailable due to failure.")
-                    self.start_button.state(["!disabled"])
-                    self._append_log(f"ERROR: {message}")
-                    self.notebook.select(self.log_tab)
+                self._handle_worker_message(event, payload)
         except queue.Empty:
             pass
         finally:
             self.root.after(150, self._poll_messages)
 
+    def _handle_worker_message(self, event: str, payload: dict[str, object]) -> None:
+        if event == "log":
+            self._append_log(str(payload.get("message", "")))
+        elif event == "status":
+            self.status_var.set(str(payload.get("message", "")))
+        elif event == "progress":
+            self._handle_progress_message(payload)
+        elif event == "done":
+            self._handle_done_message(payload)
+        elif event == "error":
+            self._handle_error_message(payload)
+
+    def _handle_progress_message(self, payload: dict[str, object]) -> None:
+        current = max(0, int(payload.get("current", 0)))
+        total = max(1, int(payload.get("total", 1)))
+        self.progress_bar["value"] = max(0.0, min(100.0, current * 100.0 / total))
+        self.progress_label_var.set(str(payload.get("message", f"{current}/{total}")))
+        self.eta_label_var.set(self._format_eta_text(current, total))
+
+    def _handle_done_message(self, payload: dict[str, object]) -> None:
+        self.progress_bar["value"] = 100
+        self.progress_label_var.set("Completed")
+        self.eta_label_var.set("Estimated completion time: completed.")
+        self.status_var.set(f"Completed successfully. output.csv written to: {payload.get('output_path', '')}")
+        self.start_button.state(["!disabled"])
+        self.notebook.select(self.log_tab)
+
+    def _handle_error_message(self, payload: dict[str, object]) -> None:
+        message = str(payload.get("message", "Unknown error."))
+        self.status_var.set(f"Run failed: {message}")
+        self.progress_label_var.set("Failed")
+        self.eta_label_var.set("Estimated completion time: unavailable due to failure.")
+        self.start_button.state(["!disabled"])
+        self._append_log("ERROR: " + message)
+        self.notebook.select(self.log_tab)
+
+
+# -----------------------------------------------------------------------------
+# Command-line interface
+# -----------------------------------------------------------------------------
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="ERA5 downloader/extractor with GUI and CLI support.")
-    parser.add_argument("--gui", action="store_true", help="Launch the GUI.")
-    parser.add_argument("--download", action="store_true", help="Run download + process from CLI.")
-    parser.add_argument("--extract", action="store_true", help="Run extract-only mode from CLI.")
+    parser = argparse.ArgumentParser(description="ERA5 single-point time-series downloader")
+    parser.add_argument("--gui", action="store_true", help="Launch GUI mode.")
     parser.add_argument("--longitude", type=float, default=INITIAL_LONGITUDE)
     parser.add_argument("--latitude", type=float, default=INITIAL_LATITUDE)
-    parser.add_argument("--start-year", type=int, default=INITIAL_START_YEAR)
-    parser.add_argument("--end-year", type=int, default=INITIAL_END_YEAR)
-    parser.add_argument("--data-dir", default=INITIAL_DATA_DIR)
-    parser.add_argument("--results-dir", default=INITIAL_RESULTS_DIR)
-    parser.add_argument("--output-csv", default=INITIAL_OUTPUT_CSV_NAME)
-    parser.add_argument("--log-file", default=INITIAL_LOG_FILE)
+    parser.add_argument("--start-date", default=INITIAL_START_DATE)
+    parser.add_argument("--end-date", default=INITIAL_END_DATE)
     return parser
 
 
-def run_cli(args: argparse.Namespace) -> int:
-    mode = "download" if args.download else "extract"
-    config = Era5Config(
-        longitude=args.longitude,
-        latitude=args.latitude,
-        start_year=args.start_year,
-        end_year=args.end_year,
-        data_dir=Path(args.data_dir),
-        results_dir=Path(args.results_dir),
-        output_csv_name=args.output_csv,
-        log_file=Path(args.log_file),
-    )
+def _validate_cli_dates(start_date: str, end_date: str) -> None:
+    datetime.fromisoformat(start_date)
+    datetime.fromisoformat(end_date)
+    if start_date > end_date:
+        raise ValueError("Start date must be less than or equal to end date.")
 
+
+def run_cli(args: argparse.Namespace) -> int:
+    start_date = str(args.start_date)
+    end_date = str(args.end_date)
+    _validate_cli_dates(start_date, end_date)
+
+    config = Era5Config(
+        longitude=float(args.longitude),
+        latitude=float(args.latitude),
+        start_date=start_date,
+        end_date=end_date,
+    )
     save_defaults(
         {
-            "mode": mode,
             "longitude": f"{config.longitude:.8f}",
             "latitude": f"{config.latitude:.8f}",
-            "start_year": str(config.start_year),
-            "end_year": str(config.end_year),
-            "data_dir": str(config.data_dir),
-            "results_dir": str(config.results_dir),
-            "output_csv_name": config.output_csv_name,
-            "log_file": str(config.log_file),
+            "start_date": config.start_date,
+            "end_date": config.end_date,
         }
     )
 
-    def cli_callback(event: str, payload: Dict) -> None:
-        if event == "log":
-            print(payload.get("message", ""))
-        elif event == "status":
+    def cli_callback(event: str, payload: dict[str, object]) -> None:
+        if event in {"log", "status"}:
             print(payload.get("message", ""))
         elif event == "progress":
-            current = payload.get("current", 0)
-            total = payload.get("total", 0)
-            message = payload.get("message", "")
-            print(f"[{current}/{total}] {message}")
+            print(f"[{payload.get('current', 0)}/{payload.get('total', 0)}] {payload.get('message', '')}")
 
-    output_path = execute_pipeline(mode=mode, config=config, callback=cli_callback)
-    print(f"Completed successfully. CSV written to: {output_path}")
+    output_path = execute_pipeline(config, callback=cli_callback)
+    print(f"Completed successfully. output.csv written to: {output_path}")
     return 0
 
 
 def main() -> int:
-    os.chdir(SCRIPT_DIR)
     parser = build_parser()
     args = parser.parse_args()
+    wants_gui = args.gui or len(sys.argv) == 1
 
-    wants_cli = args.download or args.extract
-    wants_gui = args.gui or not wants_cli
-    mode = "download" if args.download or not args.extract else "extract"
+    validate_runtime_dependencies(wants_gui=wants_gui)
 
     if wants_gui:
-        log_file = Path(getattr(args, "log_file", INITIAL_LOG_FILE)).expanduser()
-        setup_logging(log_file)
-        validate_runtime_dependencies(mode=mode, wants_gui=True, reporter=None)
         root = tk.Tk()
         Era5DownloaderGUI(root)
         root.mainloop()
@@ -1661,9 +1685,4 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    multiprocessing.freeze_support()
-    try:
-        multiprocessing.set_start_method("spawn", force=True)
-    except RuntimeError:
-        pass
     raise SystemExit(main())
